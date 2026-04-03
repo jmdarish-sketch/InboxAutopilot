@@ -1,4 +1,4 @@
-import LoadingSkeleton, {
+import {
   SkeletonSectionHeader,
   SkeletonCardList,
 } from "@/components/shared/LoadingSkeleton";

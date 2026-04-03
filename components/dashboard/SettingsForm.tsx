@@ -497,7 +497,7 @@ export default function SettingsForm({ initial }: SettingsFormProps) {
               <div>
                 <p className="text-sm font-medium text-gray-900">Delete synced email data</p>
                 <p className="mt-0.5 text-xs text-gray-400">
-                  Removes all messages, senders, and actions we've stored. Your Gmail is unaffected.
+                  Removes all messages, senders, and actions we&apos;ve stored. Your Gmail is unaffected.
                 </p>
               </div>
               <button
@@ -534,7 +534,7 @@ export default function SettingsForm({ initial }: SettingsFormProps) {
       <SharedConfirmDialog
         open={confirmDialog?.type === "disconnect"}
         title="Disconnect Gmail?"
-        description="Your autopilot will stop working. Your Gmail account won't be affected."
+        description="Your autopilot will stop working. Your Gmail account won&apos;t be affected."
         confirmLabel="Disconnect"
         onConfirm={handleDisconnect}
         onCancel={() => setConfirmDialog(null)}
@@ -542,7 +542,7 @@ export default function SettingsForm({ initial }: SettingsFormProps) {
       <SharedConfirmDialog
         open={confirmDialog?.type === "delete_email_data"}
         title="Delete synced email data?"
-        description="This removes all messages, senders, and actions we've stored locally. Your Gmail inbox won't be changed."
+        description="This removes all messages, senders, and actions we&apos;ve stored locally. Your Gmail inbox won&apos;t be changed."
         confirmLabel="Delete data"
         onConfirm={() => void handleDestructive("delete_email_data")}
         onCancel={() => setConfirmDialog(null)}

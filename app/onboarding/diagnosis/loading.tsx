@@ -1,4 +1,4 @@
-import LoadingSkeleton, {
+import {
   SkeletonSectionHeader,
   SkeletonStatRow,
   SkeletonBlock,

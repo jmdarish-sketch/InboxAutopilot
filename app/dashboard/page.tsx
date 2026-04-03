@@ -41,12 +41,6 @@ async function getDashboardData() {
 // Sub-components (server-rendered)
 // ---------------------------------------------------------------------------
 
-const MODE_LABELS: Record<string, string> = {
-  suggest_only: "Suggest Only",
-  safe:         "Safe Autopilot",
-  aggressive:   "Aggressive Autopilot",
-};
-
 function StatCard({
   label,
   value,
