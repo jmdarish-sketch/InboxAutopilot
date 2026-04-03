@@ -132,7 +132,16 @@ export async function POST() {
   try {
     // ── Phase 1: List message IDs (first call only) ──────────────────────
     if (!gmailAccount.scan_state) {
-      const gmailClient = await createGmailClient(supabaseUserId);
+      let gmailClient;
+      try {
+        gmailClient = await createGmailClient(supabaseUserId);
+      } catch (err) {
+        console.error("[scan] Failed to create Gmail client:", err);
+        return NextResponse.json(
+          { error: "Gmail authentication failed", detail: err instanceof Error ? err.message : String(err) },
+          { status: 401 }
+        );
+      }
 
       const afterDate = gmailDateString(120);
       const seen      = new Set<string>();
@@ -141,8 +150,10 @@ export async function POST() {
       await listIds(gmailClient, `in:inbox after:${afterDate}`, 5000, seen, allIds);
       await listIds(gmailClient, `category:promotions after:${afterDate}`, 5000, seen, allIds);
 
+      const ids = allIds.slice(0, 5000);
+
       const state: ScanState = {
-        messageIds:       allIds.slice(0, 5000),
+        messageIds:       ids,
         cursor:           0,
         sendersFound:     0,
         clutterDetected:  0,
@@ -157,26 +168,73 @@ export async function POST() {
       const progress: ScanProgress = {
         stage:            "listing",
         emailsScanned:    0,
-        emailsTotal:      state.messageIds.length,
+        emailsTotal:      ids.length,
         sendersFound:     0,
         clutterDetected:  0,
         protectedSenders: 0,
-        message:          `Found ${state.messageIds.length.toLocaleString()} emails — analyzing…`,
+        message:          ids.length > 0
+          ? `Found ${ids.length.toLocaleString()} emails — analyzing…`
+          : "No recent emails found.",
       };
+
+      // If no messages found, finalize immediately
+      if (ids.length === 0) {
+        return finalize(supabase, supabaseUserId, gmailAccount.id, state, 0);
+      }
 
       return NextResponse.json(progress);
     }
 
     // ── Phase 2: Process next batch ──────────────────────────────────────
     const state = gmailAccount.scan_state;
-    const total = state.messageIds.length;
+    const messageIds = state.messageIds ?? [];
+    const total = messageIds.length;
+
+    if (total === 0) {
+      return finalize(supabase, supabaseUserId, gmailAccount.id, state, 0);
+    }
 
     if (state.cursor < total) {
-      const gmailClient = await createGmailClient(supabaseUserId);
-      const batchIds    = state.messageIds.slice(state.cursor, state.cursor + BATCH_SIZE);
+      let gmailClient;
+      try {
+        gmailClient = await createGmailClient(supabaseUserId);
+      } catch (err) {
+        console.error("[scan] Failed to create Gmail client:", err);
+        return NextResponse.json(
+          { error: "Gmail authentication failed", detail: err instanceof Error ? err.message : String(err) },
+          { status: 401 }
+        );
+      }
+
+      const batchIds = messageIds.slice(state.cursor, state.cursor + BATCH_SIZE);
 
       // Fetch messages sequentially with delay to avoid 429
       const rawMessages = await fetchMessagesSequentially(gmailClient, batchIds);
+
+      // If nothing came back (all failed), still advance cursor to avoid infinite loop
+      if (!rawMessages || rawMessages.length === 0) {
+        console.warn("[scan] Batch returned 0 messages, advancing cursor past", batchIds.length, "IDs");
+        const newCursor = state.cursor + batchIds.length;
+        const updatedState: ScanState = { ...state, cursor: newCursor };
+        await supabase
+          .from("gmail_accounts")
+          .update({ scan_state: updatedState, updated_at: new Date().toISOString() })
+          .eq("id", gmailAccount.id);
+
+        if (newCursor >= total) {
+          return finalize(supabase, supabaseUserId, gmailAccount.id, updatedState, total);
+        }
+
+        return NextResponse.json({
+          stage:            "processing",
+          emailsScanned:    newCursor,
+          emailsTotal:      total,
+          sendersFound:     state.sendersFound,
+          clutterDetected:  state.clutterDetected,
+          protectedSenders: state.protectedSenders,
+          message:          `Analyzed ${newCursor.toLocaleString()} of ${total.toLocaleString()} emails…`,
+        } satisfies ScanProgress);
+      }
 
       // Classify and save
       let batchClutter   = 0;
@@ -286,19 +344,22 @@ export async function POST() {
 
         if (senderLookup) {
           for (const s of senderLookup) {
-            await supabase
-              .from("messages")
-              .update({ sender_id: s.id })
-              .eq("user_id", supabaseUserId)
-              .is("sender_id", null)
-              .in("gmail_message_id",
-                rawMessages
-                  .filter(r => {
-                    const parsed = parseMessage(r);
-                    return parsed.sender_email === s.sender_email;
-                  })
-                  .map(r => r.id)
-              );
+            const matchingGmailIds = rawMessages
+              .filter(r => {
+                if (!r?.id) return false;
+                const parsed = parseMessage(r);
+                return parsed.sender_email === s.sender_email;
+              })
+              .map(r => r.id);
+
+            if (matchingGmailIds.length > 0) {
+              await supabase
+                .from("messages")
+                .update({ sender_id: s.id })
+                .eq("user_id", supabaseUserId)
+                .is("sender_id", null)
+                .in("gmail_message_id", matchingGmailIds);
+            }
           }
         }
       }
@@ -360,13 +421,14 @@ export async function POST() {
 
   } catch (err) {
     console.error("[scan] error:", err);
+    const ss = gmailAccount.scan_state;
     const progress: ScanProgress = {
       stage:            "error",
-      emailsScanned:    gmailAccount.scan_state?.cursor ?? 0,
-      emailsTotal:      gmailAccount.scan_state?.messageIds.length ?? 0,
-      sendersFound:     gmailAccount.scan_state?.sendersFound ?? 0,
-      clutterDetected:  gmailAccount.scan_state?.clutterDetected ?? 0,
-      protectedSenders: gmailAccount.scan_state?.protectedSenders ?? 0,
+      emailsScanned:    ss?.cursor ?? 0,
+      emailsTotal:      Array.isArray(ss?.messageIds) ? ss.messageIds.length : 0,
+      sendersFound:     ss?.sendersFound ?? 0,
+      clutterDetected:  ss?.clutterDetected ?? 0,
+      protectedSenders: ss?.protectedSenders ?? 0,
       message:          err instanceof Error ? err.message : "Something went wrong. Please try again.",
     };
     return NextResponse.json(progress, { status: 500 });
@@ -452,12 +514,28 @@ async function listIds(
     };
     if (pageToken) params.pageToken = pageToken;
 
-    const data = await client.listMessages(params);
-    for (const msg of data.messages ?? []) {
-      if (!seen.has(msg.id)) { seen.add(msg.id); out.push(msg.id); }
+    let data;
+    try {
+      data = await client.listMessages(params);
+    } catch (err) {
+      console.error("[scan] listMessages failed:", err);
+      break; // stop listing, work with what we have
+    }
+
+    if (!data) break;
+
+    const messages = data.messages ?? [];
+    if (!Array.isArray(messages) || messages.length === 0) break;
+
+    for (const msg of messages) {
+      if (msg?.id && !seen.has(msg.id)) {
+        seen.add(msg.id);
+        out.push(msg.id);
+      }
       if (seen.size >= limit) break;
     }
-    if (!data.nextPageToken || !data.messages?.length) break;
+
+    if (!data.nextPageToken) break;
     pageToken = data.nextPageToken;
   }
 }
