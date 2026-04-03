@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/cron/autopilot",
-      "schedule": "*/15 * * * *"
+      "schedule": "0 */12 * * *"
     },
     {
       "path": "/api/cron/digest",
