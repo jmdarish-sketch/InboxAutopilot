@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { ScanProgress as ScanProgressData } from "@/app/api/scan/start/route";
 
@@ -161,7 +161,8 @@ function StageIndicator({ current }: { current: ScanProgressData["stage"] }) {
 // Main component — polls POST /api/scan/start
 // ---------------------------------------------------------------------------
 
-const POLL_INTERVAL = 1500; // ms between polls
+const POLL_INTERVAL   = 3000; // ms between polls
+const MAX_CONSECUTIVE_ERRORS = 3;
 
 export default function ScanProgress() {
   const router = useRouter();
@@ -176,65 +177,66 @@ export default function ScanProgress() {
     message:          "Connecting to Gmail…",
   });
 
-  const [errorMsg, setErrorMsg]     = useState<string | null>(null);
-  const [retryCount, setRetryCount] = useState(0);
-  const pollingRef                  = useRef(false);
-  const cancelledRef                = useRef(false);
-
-  const poll = useCallback(async () => {
-    if (pollingRef.current || cancelledRef.current) return;
-    pollingRef.current = true;
-
-    try {
-      const res = await fetch("/api/scan/start", { method: "POST" });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error((data as { error?: string }).error ?? `HTTP ${res.status}`);
-      }
-
-      const progress = (await res.json()) as ScanProgressData;
-      setStats(progress);
-      setRetryCount(0); // reset on success
-
-      if (progress.stage === "error") {
-        setErrorMsg(progress.message);
-        return;
-      }
-
-      if (progress.stage === "complete") {
-        // Done — don't poll again
-        return;
-      }
-
-      // Schedule next poll
-      if (!cancelledRef.current) {
-        setTimeout(() => {
-          pollingRef.current = false;
-          void poll();
-        }, POLL_INTERVAL);
-      }
-    } catch (err) {
-      // Retry up to 3 times on transient errors
-      if (retryCount < 3) {
-        setRetryCount(c => c + 1);
-        setTimeout(() => {
-          pollingRef.current = false;
-          void poll();
-        }, 2000 * (retryCount + 1));
-      } else {
-        setErrorMsg(err instanceof Error ? err.message : "Connection lost. Please refresh.");
-      }
-    } finally {
-      pollingRef.current = false;
-    }
-  }, [retryCount]);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const cancelledRef            = useRef(false);
+  const consecutiveErrorsRef    = useRef(0);
+  const timerRef                = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     cancelledRef.current = false;
+
+    async function poll() {
+      if (cancelledRef.current) return;
+
+      try {
+        const res = await fetch("/api/scan/start", { method: "POST" });
+
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({})) as { error?: string; detail?: string };
+          const msg  = data.detail ? `${data.error}: ${data.detail}` : (data.error ?? `HTTP ${res.status}`);
+          throw new Error(msg);
+        }
+
+        const progress = (await res.json()) as ScanProgressData;
+        consecutiveErrorsRef.current = 0; // reset on success
+        setStats(progress);
+
+        if (progress.stage === "error") {
+          setErrorMsg(progress.message);
+          return; // stop polling
+        }
+
+        if (progress.stage === "complete") {
+          return; // stop polling
+        }
+
+        // Schedule next poll
+        if (!cancelledRef.current) {
+          timerRef.current = setTimeout(poll, POLL_INTERVAL);
+        }
+      } catch (err) {
+        consecutiveErrorsRef.current++;
+        console.error(`[ScanProgress] poll error (${consecutiveErrorsRef.current}/${MAX_CONSECUTIVE_ERRORS}):`, err);
+
+        if (consecutiveErrorsRef.current >= MAX_CONSECUTIVE_ERRORS) {
+          setErrorMsg(err instanceof Error ? err.message : "Connection lost. Please refresh and try again.");
+          return; // stop polling
+        }
+
+        // Retry with backoff
+        if (!cancelledRef.current) {
+          timerRef.current = setTimeout(poll, POLL_INTERVAL * consecutiveErrorsRef.current);
+        }
+      }
+    }
+
     void poll();
-    return () => { cancelledRef.current = true; };
-  }, [poll]);
+
+    return () => {
+      cancelledRef.current = true;
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
 
   const pct = stats.emailsTotal > 0
     ? Math.round((stats.emailsScanned / stats.emailsTotal) * 100)

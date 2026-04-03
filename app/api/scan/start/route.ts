@@ -59,41 +59,75 @@ const IMPORTANT_CATEGORIES = new Set(["critical_transactional", "work_school", "
 // ---------------------------------------------------------------------------
 
 export async function POST() {
-  const [{ userId }, clerkUser] = await Promise.all([auth(), currentUser()]);
-  if (!userId || !clerkUser) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  // ── Auth ─────────────────────────────────────────────────────────────────
+  let clerkResult: Awaited<ReturnType<typeof auth>>;
+  let clerkUser: Awaited<ReturnType<typeof currentUser>>;
+  try {
+    [clerkResult, clerkUser] = await Promise.all([auth(), currentUser()]);
+  } catch (err) {
+    console.error("[scan] Clerk auth failed:", err);
+    return NextResponse.json(
+      { error: "Authentication failed", detail: String(err) },
+      { status: 401 }
+    );
+  }
+
+  if (!clerkResult.userId || !clerkUser) {
+    console.error("[scan] No Clerk session — userId:", clerkResult.userId, "clerkUser:", !!clerkUser);
+    return NextResponse.json(
+      { error: "Unauthorized — no active session" },
+      { status: 401 }
+    );
   }
 
   const email = clerkUser.emailAddresses[0]?.emailAddress;
   if (!email) {
-    return NextResponse.json({ error: "No email" }, { status: 400 });
+    console.error("[scan] Clerk user has no email addresses");
+    return NextResponse.json(
+      { error: "No email address on Clerk account" },
+      { status: 400 }
+    );
   }
 
-  const supabase       = createAdminClient();
-  const { data: user } = await supabase
+  // ── Resolve Supabase user ────────────────────────────────────────────────
+  const supabase = createAdminClient();
+
+  const { data: user, error: userErr } = await supabase
     .from("users")
     .select("id")
     .eq("email", email)
     .single();
 
-  if (!user) {
-    return NextResponse.json({ error: "User not found" }, { status: 404 });
+  if (userErr || !user) {
+    console.error("[scan] User lookup failed — email:", email, "error:", userErr);
+    return NextResponse.json(
+      { error: "User not found in database", detail: userErr?.message ?? `No row for ${email}` },
+      { status: 404 }
+    );
   }
 
   const supabaseUserId = user.id as string;
 
-  // Load current scan_state
-  const { data: gmailAccount } = await supabase
+  // ── Load Gmail account + scan_state ──────────────────────────────────────
+  const { data: gmailAccountRaw, error: gmailErr } = await supabase
     .from("gmail_accounts")
     .select("id, scan_state, sync_status")
     .eq("user_id", supabaseUserId)
-    .single() as unknown as {
-      data: { id: string; scan_state: ScanState | null; sync_status: string } | null;
-    };
+    .single();
 
-  if (!gmailAccount) {
-    return NextResponse.json({ error: "Gmail not connected" }, { status: 400 });
+  if (gmailErr || !gmailAccountRaw) {
+    console.error("[scan] Gmail account lookup failed — userId:", supabaseUserId, "error:", gmailErr);
+    return NextResponse.json(
+      { error: "Gmail not connected", detail: gmailErr?.message ?? "No gmail_accounts row found" },
+      { status: 400 }
+    );
   }
+
+  const gmailAccount = gmailAccountRaw as unknown as {
+    id: string;
+    scan_state: ScanState | null;
+    sync_status: string;
+  };
 
   try {
     // ── Phase 1: List message IDs (first call only) ──────────────────────
