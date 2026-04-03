@@ -1,19 +1,18 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import type { ScanProgress } from "@/app/api/scan/start/route";
+import type { ScanProgress as ScanProgressData } from "@/app/api/scan/start/route";
 
 // ---------------------------------------------------------------------------
 // Animated counter hook
-// Smoothly counts from the previous value to the next value over ~400ms.
 // ---------------------------------------------------------------------------
 
 function useAnimatedCount(target: number): number {
   const [display, setDisplay]   = useState(0);
   const rafRef                  = useRef<number | null>(null);
   const startRef                = useRef({ from: 0, to: 0, startTime: 0 });
-  const DURATION                = 400; // ms
+  const DURATION                = 400;
 
   useEffect(() => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -22,7 +21,6 @@ function useAnimatedCount(target: number): number {
     function tick() {
       const elapsed  = performance.now() - startRef.current.startTime;
       const progress = Math.min(elapsed / DURATION, 1);
-      // ease-out cubic
       const eased    = 1 - Math.pow(1 - progress, 3);
       const current  = Math.round(
         startRef.current.from + (startRef.current.to - startRef.current.from) * eased
@@ -58,7 +56,6 @@ function StatCard({ label, value, active, variant }: StatCardProps) {
     clutter:   "border-amber-100 bg-amber-50",
     protected: "border-green-100 bg-green-50",
   };
-
   const valueStyles = {
     neutral:   "text-gray-900",
     clutter:   "text-amber-700",
@@ -104,40 +101,41 @@ function ProgressBar({ pct }: { pct: number }) {
 }
 
 // ---------------------------------------------------------------------------
-// Stage label helpers
+// Stage indicator
 // ---------------------------------------------------------------------------
 
-const STAGE_LABELS: Record<ScanProgress["stage"], string> = {
-  connecting: "Connecting",
-  fetching:   "Fetching emails",
+const STAGE_LABELS: Record<ScanProgressData["stage"], string> = {
+  listing:    "Listing",
   processing: "Analyzing",
-  saving:     "Saving",
+  finalizing: "Saving",
   complete:   "Complete",
+  error:      "Error",
 };
 
-const STAGE_ORDER: ScanProgress["stage"][] = [
-  "connecting", "fetching", "processing", "saving", "complete",
+const STAGE_ORDER: ScanProgressData["stage"][] = [
+  "listing", "processing", "finalizing", "complete",
 ];
 
-function StageIndicator({ current }: { current: ScanProgress["stage"] }) {
+function StageIndicator({ current }: { current: ScanProgressData["stage"] }) {
   const idx = STAGE_ORDER.indexOf(current);
   return (
     <ol className="flex items-center gap-3">
       {STAGE_ORDER.filter((s) => s !== "complete").map((stage, i) => {
         const done    = i < idx;
-        const active  = i === idx;
+        const active  = i === idx || (current === "complete" && i === STAGE_ORDER.length - 2);
         return (
           <li key={stage} className="flex items-center gap-2">
             {i > 0 && <span className="h-px w-4 bg-gray-200" />}
             <span
               className={`
                 flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold
-                ${done   ? "bg-blue-500 text-white"
+                ${done || current === "complete"
+                  ? "bg-blue-500 text-white"
                   : active ? "border-2 border-blue-500 text-blue-600"
                   : "border-2 border-gray-200 text-gray-400"}
               `}
             >
-              {done ? (
+              {done || current === "complete" ? (
                 <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none">
                   <path d="M2 6l3 3 5-5" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
@@ -147,7 +145,7 @@ function StageIndicator({ current }: { current: ScanProgress["stage"] }) {
             </span>
             <span
               className={`text-xs font-medium hidden sm:inline ${
-                active ? "text-gray-900" : done ? "text-blue-500" : "text-gray-400"
+                active || current === "complete" ? "text-gray-900" : done ? "text-blue-500" : "text-gray-400"
               }`}
             >
               {STAGE_LABELS[stage]}
@@ -160,14 +158,16 @@ function StageIndicator({ current }: { current: ScanProgress["stage"] }) {
 }
 
 // ---------------------------------------------------------------------------
-// Main component
+// Main component — polls POST /api/scan/start
 // ---------------------------------------------------------------------------
+
+const POLL_INTERVAL = 1500; // ms between polls
 
 export default function ScanProgress() {
   const router = useRouter();
 
-  const [stats, setStats]   = useState<ScanProgress>({
-    stage:            "connecting",
+  const [stats, setStats] = useState<ScanProgressData>({
+    stage:            "listing",
     emailsScanned:    0,
     emailsTotal:      0,
     sendersFound:     0,
@@ -176,49 +176,72 @@ export default function ScanProgress() {
     message:          "Connecting to Gmail…",
   });
 
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const esRef                   = useRef<EventSource | null>(null);
+  const [errorMsg, setErrorMsg]     = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const pollingRef                  = useRef(false);
+  const cancelledRef                = useRef(false);
+
+  const poll = useCallback(async () => {
+    if (pollingRef.current || cancelledRef.current) return;
+    pollingRef.current = true;
+
+    try {
+      const res = await fetch("/api/scan/start", { method: "POST" });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as { error?: string }).error ?? `HTTP ${res.status}`);
+      }
+
+      const progress = (await res.json()) as ScanProgressData;
+      setStats(progress);
+      setRetryCount(0); // reset on success
+
+      if (progress.stage === "error") {
+        setErrorMsg(progress.message);
+        return;
+      }
+
+      if (progress.stage === "complete") {
+        // Done — don't poll again
+        return;
+      }
+
+      // Schedule next poll
+      if (!cancelledRef.current) {
+        setTimeout(() => {
+          pollingRef.current = false;
+          void poll();
+        }, POLL_INTERVAL);
+      }
+    } catch (err) {
+      // Retry up to 3 times on transient errors
+      if (retryCount < 3) {
+        setRetryCount(c => c + 1);
+        setTimeout(() => {
+          pollingRef.current = false;
+          void poll();
+        }, 2000 * (retryCount + 1));
+      } else {
+        setErrorMsg(err instanceof Error ? err.message : "Connection lost. Please refresh.");
+      }
+    } finally {
+      pollingRef.current = false;
+    }
+  }, [retryCount]);
 
   useEffect(() => {
-    const es = new EventSource("/api/scan/start");
-    esRef.current = es;
-
-    es.addEventListener("progress", (e) => {
-      setStats(JSON.parse(e.data) as ScanProgress);
-    });
-
-    es.addEventListener("complete", (e) => {
-      setStats(JSON.parse(e.data) as ScanProgress);
-      es.close();
-    });
-
-    es.addEventListener("error", (e) => {
-      // Named 'error' event from server (not a connection failure)
-      if (e instanceof MessageEvent) {
-        const data = JSON.parse(e.data) as { message: string };
-        setErrorMsg(data.message);
-      } else {
-        setErrorMsg("Connection lost. Please refresh and try again.");
-      }
-      es.close();
-    });
-
-    // Handle connection-level error (network drop etc.)
-    es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED) {
-        setErrorMsg("Connection lost. Please refresh and try again.");
-      }
-    };
-
-    return () => es.close();
-  }, []);
+    cancelledRef.current = false;
+    void poll();
+    return () => { cancelledRef.current = true; };
+  }, [poll]);
 
   const pct = stats.emailsTotal > 0
     ? Math.round((stats.emailsScanned / stats.emailsTotal) * 100)
-    : stats.stage === "connecting" ? 0 : stats.stage === "fetching" ? 5 : 100;
+    : stats.stage === "listing" ? 5 : 100;
 
   const isComplete = stats.stage === "complete";
-  const isActive   = (stat: keyof ScanProgress) =>
+  const isActive   = (stat: keyof ScanProgressData) =>
     !isComplete && stats[stat] !== 0;
 
   if (errorMsg) {
