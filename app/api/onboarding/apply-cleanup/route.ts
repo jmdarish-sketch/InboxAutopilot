@@ -2,6 +2,7 @@ import { auth, currentUser } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse }  from "next/server";
 import { createAdminClient }          from "@/lib/supabase/admin";
 import { archiveGmailMessages, attemptUnsubscribe } from "@/lib/gmail/actions";
+import { setSenderRule }              from "@/lib/senders/set-rule";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -58,13 +59,7 @@ export async function POST(req: NextRequest) {
 
   for (const sel of body.selections) {
     if (sel.action === "keep") {
-      await supabase.from("sender_rules").insert({
-        user_id:     supabaseUserId,
-        sender_id:   sel.senderId,
-        rule_type:   "sender_exact",
-        rule_action: "always_keep",
-        source:      "onboarding_cleanup",
-      });
+      await setSenderRule(supabaseUserId, sel.senderId, "always_keep", "onboarding_cleanup");
       continue;
     }
 
@@ -112,13 +107,7 @@ export async function POST(req: NextRequest) {
       });
 
       // 5. Create sender rule so autopilot knows to keep archiving
-      await supabase.from("sender_rules").insert({
-        user_id:     supabaseUserId,
-        sender_id:   sel.senderId,
-        rule_type:   "sender_exact",
-        rule_action: "always_archive",
-        source:      "onboarding_cleanup",
-      });
+      await setSenderRule(supabaseUserId, sel.senderId, "always_archive", "onboarding_cleanup");
 
       totalArchived += archived;
     } catch (err) {

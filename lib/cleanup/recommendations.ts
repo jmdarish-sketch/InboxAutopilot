@@ -172,27 +172,33 @@ export async function buildCleanupRecommendations(
     }
   }
 
-  const recommendations: CleanupRecommendation[] = clutter.map(s => {
-    const recentCount = recentCounts.get(s.id) ?? 0;
-    const hasSub      = hasUnsub.has(s.id);
-    const openRate    = s.message_count > 0
-      ? Math.round((s.open_count / s.message_count) * 100)
-      : 0;
+  const recommendations: CleanupRecommendation[] = clutter
+    .filter(s => {
+      // Safety: skip senders with meaningful open rate (>15%)
+      const openRate = s.message_count > 0 ? s.open_count / s.message_count : 0;
+      return openRate <= 0.15;
+    })
+    .map(s => {
+      const recentCount = recentCounts.get(s.id) ?? 0;
+      const hasSub      = hasUnsub.has(s.id);
+      const openRate    = s.message_count > 0
+        ? Math.round((s.open_count / s.message_count) * 100)
+        : 0;
 
-    return {
-      senderId:        s.id,
-      senderEmail:     s.sender_email,
-      senderName:      s.sender_name ?? null,
-      senderDomain:    s.sender_domain,
-      messageCount:    s.message_count,
-      recentCount,
-      openRate,
-      suggestedAction: hasSub ? "unsubscribe_and_archive" : "archive",
-      confidence:      confidenceLabel(s.clutter_score),
-      reason:          buildReason(s.message_count, recentCount, s.open_count, hasSub),
-      sampleSubjects:  subjectsMap.get(s.id) ?? [],
-    };
-  });
+      return {
+        senderId:        s.id,
+        senderEmail:     s.sender_email,
+        senderName:      s.sender_name ?? null,
+        senderDomain:    s.sender_domain,
+        messageCount:    s.message_count,
+        recentCount,
+        openRate,
+        suggestedAction: hasSub ? "unsubscribe_and_archive" : "archive",
+        confidence:      confidenceLabel(s.clutter_score),
+        reason:          buildReason(s.message_count, recentCount, s.open_count, hasSub),
+        sampleSubjects:  subjectsMap.get(s.id) ?? [],
+      };
+    });
 
   return { recommendations, protected: protectedSenders };
 }

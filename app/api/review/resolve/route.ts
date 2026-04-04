@@ -3,6 +3,7 @@ import { NextRequest, NextResponse }   from "next/server";
 import { createAdminClient }           from "@/lib/supabase/admin";
 import { archiveGmailMessages, attemptUnsubscribe } from "@/lib/gmail/actions";
 import { recordFeedbackAndRetrain }    from "@/lib/review/learning";
+import { setSenderRule }               from "@/lib/senders/set-rule";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -134,13 +135,7 @@ export async function POST(req: NextRequest) {
         .eq("user_id", supabaseUserId);
 
       if (senderId) {
-        await supabase.from("sender_rules").insert({
-          user_id:     supabaseUserId,
-          sender_id:   senderId,
-          rule_type:   "sender_exact",
-          rule_action: "always_keep",
-          source:      "user_manual",
-        });
+        await setSenderRule(supabaseUserId, senderId, "always_keep", "user_manual");
       }
 
       await recordFeedbackAndRetrain(supabaseUserId, "sender_keep_forever", {
@@ -175,13 +170,7 @@ export async function POST(req: NextRequest) {
       });
 
       if (senderId) {
-        await supabase.from("sender_rules").insert({
-          user_id:     supabaseUserId,
-          sender_id:   senderId,
-          rule_type:   "sender_exact",
-          rule_action: "always_archive",
-          source:      "user_manual",
-        });
+        await setSenderRule(supabaseUserId, senderId, "always_archive", "user_manual");
       }
 
       await recordFeedbackAndRetrain(supabaseUserId, "sender_archive_forever", {

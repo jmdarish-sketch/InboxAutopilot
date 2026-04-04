@@ -14,15 +14,23 @@ export async function archiveGmailMessages(
   await client.batchModifyLabels(gmailMessageIds, undefined, ["INBOX"]);
 }
 
+export interface UnsubscribeResult {
+  attempted: boolean;
+  method:    "url" | "mailto" | "none";
+  success:   boolean;
+}
+
 /**
  * Attempts an RFC 8058 one-click unsubscribe for a sender.
- * Looks up the unsubscribe URL from the first matching message in the DB.
- * Returns true if the request was sent (not necessarily successful).
+ * Tries URL-based unsubscribe first, reports method used in result.
+ *
+ * Does NOT support mailto: unsubscribe (would require sending email).
+ * Returns structured result so callers can log the method honestly.
  */
 export async function attemptUnsubscribe(
   supabaseUserId: string,
   senderId: string
-): Promise<boolean> {
+): Promise<UnsubscribeResult> {
   const supabase = createAdminClient();
 
   const { data: msg } = await supabase
@@ -34,19 +42,36 @@ export async function attemptUnsubscribe(
     .limit(1)
     .maybeSingle();
 
-  if (!msg?.unsubscribe_url) return false;
-
-  try {
-    // RFC 8058: POST with application/x-www-form-urlencoded body
-    const res = await fetch(msg.unsubscribe_url, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "List-Unsubscribe=One-Click",
-      signal: AbortSignal.timeout(10_000),
-    });
-    // Treat any non-5xx response as "attempted"
-    return res.status < 500;
-  } catch {
-    return false;
+  // Try URL-based one-click unsubscribe
+  if (msg?.unsubscribe_url) {
+    try {
+      const res = await fetch(msg.unsubscribe_url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "List-Unsubscribe=One-Click",
+        signal: AbortSignal.timeout(10_000),
+      });
+      return { attempted: true, method: "url", success: res.status < 500 };
+    } catch {
+      return { attempted: true, method: "url", success: false };
+    }
   }
+
+  // Check if mailto-only unsubscribe exists (we can't act on it, but report it)
+  if (!msg) {
+    const { data: mailtoMsg } = await supabase
+      .from("messages")
+      .select("unsubscribe_mailto")
+      .eq("user_id", supabaseUserId)
+      .eq("sender_id", senderId)
+      .not("unsubscribe_mailto", "is", null)
+      .limit(1)
+      .maybeSingle();
+
+    if (mailtoMsg?.unsubscribe_mailto) {
+      return { attempted: false, method: "mailto", success: false };
+    }
+  }
+
+  return { attempted: false, method: "none", success: false };
 }

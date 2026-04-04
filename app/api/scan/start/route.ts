@@ -7,6 +7,7 @@ import { extractFeatures, type SenderRecord } from "@/lib/classification/feature
 import { classifyDeterministically }   from "@/lib/classification/rules";
 import { scoreMessage }                from "@/lib/classification/scorer";
 import { resolveFinalClassification }  from "@/lib/classification/final-decision";
+import type { NormalizedMessage }      from "@/lib/gmail/types";
 
 export const dynamic = "force-dynamic";
 
@@ -236,20 +237,86 @@ export async function POST() {
         } satisfies ScanProgress);
       }
 
-      // Classify and save
-      let batchClutter   = 0;
-      let batchImportant = 0;
-      const senderEmails = new Set<string>();
+      // ── Pass 1: Parse all messages + aggregate sender stats ──────────
+      const normalizedMessages = rawMessages.map(parseMessage);
+      const batchSenders       = aggregateBatchSenders(normalizedMessages);
+      const senderEmails       = [...batchSenders.keys()].filter(e => e !== "" && e !== "__unknown__");
 
-      const senderRows: Array<Record<string, unknown>> = [];
+      // Fetch existing sender rows from DB for merge
+      let existingSenderMap = new Map<string, DbSenderRow>();
+      if (senderEmails.length > 0) {
+        const { data: existingSenders } = await supabase
+          .from("senders")
+          .select("id, sender_email, message_count, open_count, reply_count, archive_count, restore_count, click_count, search_count, learned_state, first_seen_at, last_seen_at, importance_score, clutter_score")
+          .eq("user_id", supabaseUserId)
+          .in("sender_email", senderEmails) as unknown as {
+            data: DbSenderRow[] | null;
+          };
+        if (existingSenders) {
+          existingSenderMap = new Map(existingSenders.map(s => [s.sender_email, s]));
+        }
+      }
+
+      // Merge batch stats with existing DB stats
+      const mergedProfiles = new Map<string, SenderRecord>();
+      const senderUpsertRows: Array<Record<string, unknown>> = [];
+
+      for (const [email, batch] of batchSenders) {
+        if (!email || email === "__unknown__") continue;
+        const existing = existingSenderMap.get(email) ?? null;
+        const merged   = mergeSenderStats(existing, batch);
+        mergedProfiles.set(email, merged);
+
+        senderUpsertRows.push({
+          user_id:          supabaseUserId,
+          sender_email:     email,
+          sender_name:      batch.sender_name,
+          sender_domain:    batch.sender_domain || "",
+          first_seen_at:    merged.first_seen_at,
+          last_seen_at:     merged.last_seen_at,
+          message_count:    merged.message_count,
+          open_count:       merged.open_count,
+          reply_count:      merged.reply_count,
+          archive_count:    merged.archive_count,
+          restore_count:    merged.restore_count,
+          click_count:      merged.click_count,
+          search_count:     merged.search_count,
+          learned_state:    merged.learned_state,
+          updated_at:       new Date().toISOString(),
+        });
+      }
+
+      // Upsert senders with merged stats
+      for (let i = 0; i < senderUpsertRows.length; i += DB_CHUNK) {
+        const chunk = senderUpsertRows.slice(i, i + DB_CHUNK);
+        await supabase
+          .from("senders")
+          .upsert(chunk, { onConflict: "user_id,sender_email" });
+      }
+
+      // Fetch sender IDs for FK linking
+      const senderIdMap = new Map<string, string>();
+      if (senderEmails.length > 0) {
+        const { data: senderLookup } = await supabase
+          .from("senders")
+          .select("id, sender_email")
+          .eq("user_id", supabaseUserId)
+          .in("sender_email", senderEmails) as unknown as {
+            data: Array<{ id: string; sender_email: string }> | null;
+          };
+        if (senderLookup) {
+          for (const s of senderLookup) senderIdMap.set(s.sender_email, s.id);
+        }
+      }
+
+      // ── Pass 2: Classify using merged sender profiles ─────────────────
       const messageRows: Array<Record<string, unknown>> = [];
+      const importanceByEmail = new Map<string, number[]>();
+      const clutterByEmail    = new Map<string, number[]>();
 
-      for (const raw of rawMessages) {
-        const normalized   = parseMessage(raw);
-        const senderKey    = normalized.sender_email ?? "__unknown__";
-        senderEmails.add(senderKey);
-
-        const senderRecord = buildEmptySenderRecord();
+      for (const normalized of normalizedMessages) {
+        const sEmail       = normalized.sender_email ?? "";
+        const senderRecord = mergedProfiles.get(sEmail) ?? buildEmptySenderRecord();
         const features     = extractFeatures(normalized, senderRecord);
         const deterministic = classifyDeterministically(normalized, features);
         const scored        = scoreMessage(normalized, senderRecord, features, deterministic);
@@ -258,25 +325,17 @@ export async function POST() {
           deterministic, scored, llmDecision: null,
         });
 
-        if (CLUTTER_CATEGORIES.has(final.finalCategory))   batchClutter++;
-        if (IMPORTANT_CATEGORIES.has(final.finalCategory))  batchImportant++;
-
-        senderRows.push({
-          user_id:          supabaseUserId,
-          sender_email:     normalized.sender_email ?? "",
-          sender_name:      normalized.sender_name,
-          sender_domain:    normalized.sender_domain ?? "",
-          first_seen_at:    normalized.internal_date,
-          last_seen_at:     normalized.internal_date,
-          message_count:    1,
-          importance_score: Math.round(scored.importanceScore),
-          clutter_score:    Math.round(scored.clutterScore),
-          learned_state:    "unknown",
-          updated_at:       new Date().toISOString(),
-        });
+        // Accumulate scores to update sender averages
+        if (sEmail) {
+          if (!importanceByEmail.has(sEmail)) importanceByEmail.set(sEmail, []);
+          if (!clutterByEmail.has(sEmail))    clutterByEmail.set(sEmail, []);
+          importanceByEmail.get(sEmail)!.push(scored.importanceScore);
+          clutterByEmail.get(sEmail)!.push(scored.clutterScore);
+        }
 
         messageRows.push({
           user_id:              supabaseUserId,
+          sender_id:            senderIdMap.get(sEmail) ?? null,
           gmail_message_id:     normalized.gmail_message_id,
           gmail_thread_id:      normalized.gmail_thread_id,
           gmail_history_id:     normalized.gmail_history_id,
@@ -314,14 +373,6 @@ export async function POST() {
         });
       }
 
-      // Write senders (upsert — increment message_count for existing)
-      for (let i = 0; i < senderRows.length; i += DB_CHUNK) {
-        const chunk = senderRows.slice(i, i + DB_CHUNK);
-        await supabase
-          .from("senders")
-          .upsert(chunk, { onConflict: "user_id,sender_email" });
-      }
-
       // Write messages
       for (let i = 0; i < messageRows.length; i += DB_CHUNK) {
         const chunk = messageRows.slice(i, i + DB_CHUNK);
@@ -330,38 +381,24 @@ export async function POST() {
           .upsert(chunk, { onConflict: "user_id,gmail_message_id" });
       }
 
-      // Back-fill sender_id on the messages we just wrote
-      // (sender upsert doesn't return IDs reliably with onConflict, so look them up)
-      const uniqueEmails = [...senderEmails].filter(e => e !== "__unknown__");
-      if (uniqueEmails.length > 0) {
-        const { data: senderLookup } = await supabase
+      // Update sender importance/clutter scores from classification results
+      for (const [email, scores] of importanceByEmail) {
+        const senderId = senderIdMap.get(email);
+        if (!senderId || scores.length === 0) continue;
+        const clutterScores = clutterByEmail.get(email) ?? [];
+        const avgImportance = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+        const avgClutter    = clutterScores.length > 0
+          ? Math.round(clutterScores.reduce((a, b) => a + b, 0) / clutterScores.length)
+          : 0;
+        await supabase
           .from("senders")
-          .select("id, sender_email")
-          .eq("user_id", supabaseUserId)
-          .in("sender_email", uniqueEmails) as unknown as {
-            data: Array<{ id: string; sender_email: string }> | null;
-          };
-
-        if (senderLookup) {
-          for (const s of senderLookup) {
-            const matchingGmailIds = rawMessages
-              .filter(r => {
-                if (!r?.id) return false;
-                const parsed = parseMessage(r);
-                return parsed.sender_email === s.sender_email;
-              })
-              .map(r => r.id);
-
-            if (matchingGmailIds.length > 0) {
-              await supabase
-                .from("messages")
-                .update({ sender_id: s.id })
-                .eq("user_id", supabaseUserId)
-                .is("sender_id", null)
-                .in("gmail_message_id", matchingGmailIds);
-            }
-          }
-        }
+          .update({
+            importance_score: avgImportance,
+            clutter_score:    avgClutter,
+            trust_score:      avgImportance,
+            updated_at:       new Date().toISOString(),
+          })
+          .eq("id", senderId);
       }
 
       // Update cursor + running stats
@@ -378,11 +415,12 @@ export async function POST() {
           .from("senders")
           .select("id", { count: "exact", head: true })
           .eq("user_id", supabaseUserId),
+        // Count distinct senders with high importance — not messages
         supabase
-          .from("messages")
+          .from("senders")
           .select("id", { count: "exact", head: true })
           .eq("user_id", supabaseUserId)
-          .in("final_category", [...IMPORTANT_CATEGORIES]),
+          .gte("importance_score", 65),
       ]);
 
       const updatedState: ScanState = {
@@ -600,4 +638,89 @@ function buildEmptySenderRecord(): SenderRecord {
     last_seen_at:  null,
     learned_state: "unknown",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Two-pass scan helpers
+// ---------------------------------------------------------------------------
+
+interface SenderAggregate {
+  sender_email:  string;
+  sender_name:   string | null;
+  sender_domain: string;
+  first_seen_at: string | null;
+  last_seen_at:  string | null;
+  message_count: number;
+  open_count:    number;
+  reply_count:   number;
+}
+
+interface DbSenderRow {
+  id:               string;
+  sender_email:     string;
+  message_count:    number;
+  open_count:       number;
+  reply_count:      number;
+  archive_count:    number;
+  restore_count:    number;
+  click_count:      number;
+  search_count:     number;
+  learned_state:    string;
+  first_seen_at:    string | null;
+  last_seen_at:     string | null;
+  importance_score: number;
+  clutter_score:    number;
+}
+
+function aggregateBatchSenders(messages: NormalizedMessage[]): Map<string, SenderAggregate> {
+  const map = new Map<string, SenderAggregate>();
+
+  for (const msg of messages) {
+    const email = msg.sender_email ?? "";
+    if (!email) continue;
+
+    const existing = map.get(email) ?? {
+      sender_email:  email,
+      sender_name:   msg.sender_name ?? null,
+      sender_domain: msg.sender_domain ?? "",
+      first_seen_at: msg.internal_date ?? null,
+      last_seen_at:  msg.internal_date ?? null,
+      message_count: 0,
+      open_count:    0,
+      reply_count:   0,
+    };
+
+    existing.message_count += 1;
+    if (msg.is_read) existing.open_count += 1;
+
+    if (msg.internal_date && (!existing.first_seen_at || msg.internal_date < existing.first_seen_at)) {
+      existing.first_seen_at = msg.internal_date;
+    }
+    if (msg.internal_date && (!existing.last_seen_at || msg.internal_date > existing.last_seen_at)) {
+      existing.last_seen_at = msg.internal_date;
+    }
+
+    map.set(email, existing);
+  }
+
+  return map;
+}
+
+function mergeSenderStats(
+  existing: DbSenderRow | null,
+  batch: SenderAggregate
+): SenderRecord & { first_seen_at: string | null; last_seen_at: string | null } {
+  const merged = {
+    message_count:  (existing?.message_count ?? 0) + batch.message_count,
+    open_count:     (existing?.open_count    ?? 0) + batch.open_count,
+    reply_count:    (existing?.reply_count   ?? 0) + batch.reply_count,
+    archive_count:  existing?.archive_count  ?? 0,
+    restore_count:  existing?.restore_count  ?? 0,
+    click_count:    existing?.click_count    ?? 0,
+    search_count:   existing?.search_count   ?? 0,
+    learned_state:  existing?.learned_state  ?? "unknown",
+    last_seen_at:   batch.last_seen_at ?? existing?.last_seen_at ?? null,
+    first_seen_at:  existing?.first_seen_at ?? batch.first_seen_at,
+  };
+  return merged;
 }

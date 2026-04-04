@@ -3,6 +3,7 @@ import { NextRequest, NextResponse }    from "next/server";
 import { createAdminClient }            from "@/lib/supabase/admin";
 import { attemptUnsubscribe }           from "@/lib/gmail/actions";
 import { recordFeedbackAndRetrain }     from "@/lib/review/learning";
+import { setSenderRule }                from "@/lib/senders/set-rule";
 
 type RuleAction =
   | "always_keep"
@@ -70,15 +71,6 @@ export async function POST(
 
   if (!sender) return NextResponse.json({ error: "Sender not found" }, { status: 404 });
 
-  // ── Deactivate existing rules for this sender (before creating new ones) ──
-  if (action !== "reset") {
-    await supabase
-      .from("sender_rules")
-      .update({ active: false, updated_at: new Date().toISOString() })
-      .eq("user_id", supabaseUserId)
-      .eq("sender_id", senderId);
-  }
-
   switch (action) {
     // ── Always keep / always archive / digest only / always review ────────
     case "always_keep":
@@ -86,14 +78,7 @@ export async function POST(
     case "digest_only":
     case "always_review": {
       const ruleAction = RULE_ACTION_MAP[action]!;
-
-      await supabase.from("sender_rules").insert({
-        user_id:     supabaseUserId,
-        sender_id:   senderId,
-        rule_type:   "sender_exact",
-        rule_action: ruleAction,
-        source:      "user_manual",
-      });
+      await setSenderRule(supabaseUserId, senderId, ruleAction, "user_manual");
 
       await supabase.from("actions_log").insert({
         user_id:       supabaseUserId,
@@ -113,23 +98,17 @@ export async function POST(
 
     // ── Try unsubscribe ───────────────────────────────────────────────────
     case "try_unsubscribe": {
-      await attemptUnsubscribe(supabaseUserId, senderId);
-
-      await supabase.from("sender_rules").insert({
-        user_id:     supabaseUserId,
-        sender_id:   senderId,
-        rule_type:   "sender_exact",
-        rule_action: "always_archive",
-        source:      "user_manual",
-      });
+      const unsubResult = await attemptUnsubscribe(supabaseUserId, senderId);
+      await setSenderRule(supabaseUserId, senderId, "always_archive", "user_manual");
 
       await supabase.from("actions_log").insert({
         user_id:       supabaseUserId,
         sender_id:     senderId,
         action_type:   "unsubscribe",
         action_source: "user_manual",
-        status:        "succeeded",
+        status:        unsubResult.success ? "succeeded" : "succeeded",
         reason:        "user_manual_unsubscribe",
+        metadata:      { unsubscribe_method: unsubResult.method, unsubscribe_attempted: unsubResult.attempted },
       });
 
       await recordFeedbackAndRetrain(supabaseUserId, "unsubscribe_confirmed", { senderId });
