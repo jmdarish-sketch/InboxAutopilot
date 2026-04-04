@@ -1,6 +1,6 @@
-import { auth, currentUser }          from "@clerk/nextjs/server";
 import { NextResponse }                from "next/server";
 import { createAdminClient }           from "@/lib/supabase/admin";
+import { getSupabaseUserId }           from "@/lib/auth/get-user";
 import { createGmailClient }           from "@/lib/gmail/client";
 import { parseMessage }                from "@/lib/gmail/parser";
 import { extractFeatures, type SenderRecord } from "@/lib/classification/features";
@@ -61,53 +61,22 @@ const IMPORTANT_CATEGORIES = new Set(["critical_transactional", "work_school", "
 
 export async function POST() {
   // ── Auth ─────────────────────────────────────────────────────────────────
-  let clerkResult: Awaited<ReturnType<typeof auth>>;
-  let clerkUser: Awaited<ReturnType<typeof currentUser>>;
+  let supabaseUserId: string;
   try {
-    [clerkResult, clerkUser] = await Promise.all([auth(), currentUser()]);
+    const id = await getSupabaseUserId();
+    if (!id) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    supabaseUserId = id;
   } catch (err) {
-    console.error("[scan] Clerk auth failed:", err);
+    console.error("[scan] Auth failed:", err);
     return NextResponse.json(
       { error: "Authentication failed", detail: String(err) },
       { status: 401 }
     );
   }
 
-  if (!clerkResult.userId || !clerkUser) {
-    console.error("[scan] No Clerk session — userId:", clerkResult.userId, "clerkUser:", !!clerkUser);
-    return NextResponse.json(
-      { error: "Unauthorized — no active session" },
-      { status: 401 }
-    );
-  }
-
-  const email = clerkUser.emailAddresses[0]?.emailAddress;
-  if (!email) {
-    console.error("[scan] Clerk user has no email addresses");
-    return NextResponse.json(
-      { error: "No email address on Clerk account" },
-      { status: 400 }
-    );
-  }
-
-  // ── Resolve Supabase user ────────────────────────────────────────────────
   const supabase = createAdminClient();
-
-  const { data: user, error: userErr } = await supabase
-    .from("users")
-    .select("id")
-    .eq("email", email)
-    .single();
-
-  if (userErr || !user) {
-    console.error("[scan] User lookup failed — email:", email, "error:", userErr);
-    return NextResponse.json(
-      { error: "User not found in database", detail: userErr?.message ?? `No row for ${email}` },
-      { status: 404 }
-    );
-  }
-
-  const supabaseUserId = user.id as string;
 
   // ── Load Gmail account + scan_state ──────────────────────────────────────
   const { data: gmailAccountRaw, error: gmailErr } = await supabase
@@ -258,12 +227,14 @@ export async function POST() {
       }
 
       // Merge batch stats with existing DB stats
-      const mergedProfiles = new Map<string, SenderRecord>();
+      const mergedProfiles    = new Map<string, SenderRecord>();
+      const previousSenderMap = new Map<string, DbSenderRow | null>();
       const senderUpsertRows: Array<Record<string, unknown>> = [];
 
       for (const [email, batch] of batchSenders) {
         if (!email || email === "__unknown__") continue;
         const existing = existingSenderMap.get(email) ?? null;
+        previousSenderMap.set(email, existing);
         const merged   = mergeSenderStats(existing, batch);
         mergedProfiles.set(email, merged);
 
@@ -381,21 +352,35 @@ export async function POST() {
           .upsert(chunk, { onConflict: "user_id,gmail_message_id" });
       }
 
-      // Update sender importance/clutter scores from classification results
-      for (const [email, scores] of importanceByEmail) {
+      // Update sender scores with historically weighted averages
+      for (const [email, batchImportanceScores] of importanceByEmail) {
         const senderId = senderIdMap.get(email);
-        if (!senderId || scores.length === 0) continue;
-        const clutterScores = clutterByEmail.get(email) ?? [];
-        const avgImportance = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
-        const avgClutter    = clutterScores.length > 0
-          ? Math.round(clutterScores.reduce((a, b) => a + b, 0) / clutterScores.length)
+        if (!senderId || batchImportanceScores.length === 0) continue;
+
+        const existing          = previousSenderMap.get(email) ?? null;
+        const previousCount     = existing?.message_count ?? 0;
+        const previousImportance = Number(existing?.importance_score ?? 0);
+        const previousClutter    = Number(existing?.clutter_score ?? 0);
+
+        const batchImportanceSum = batchImportanceScores.reduce((a, b) => a + b, 0);
+        const batchClutterScores = clutterByEmail.get(email) ?? [];
+        const batchClutterSum    = batchClutterScores.reduce((a, b) => a + b, 0);
+        const batchCount         = batchImportanceScores.length;
+        const totalCount         = previousCount + batchCount;
+
+        const weightedImportance = totalCount > 0
+          ? Math.round(((previousImportance * previousCount) + batchImportanceSum) / totalCount)
           : 0;
+        const weightedClutter = totalCount > 0
+          ? Math.round(((previousClutter * previousCount) + batchClutterSum) / totalCount)
+          : 0;
+
         await supabase
           .from("senders")
           .update({
-            importance_score: avgImportance,
-            clutter_score:    avgClutter,
-            trust_score:      avgImportance,
+            importance_score: weightedImportance,
+            clutter_score:    weightedClutter,
+            trust_score:      weightedImportance,
             updated_at:       new Date().toISOString(),
           })
           .eq("id", senderId);

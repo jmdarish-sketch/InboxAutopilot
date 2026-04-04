@@ -1,4 +1,4 @@
-import { auth, currentUser } from "@clerk/nextjs/server";
+import { getSupabaseUserId } from "@/lib/auth/get-user";
 import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient }         from "@/lib/supabase/admin";
 import { fetchReviewItems }          from "@/lib/review/queries";
@@ -11,22 +11,11 @@ const VALID_FILTERS = new Set<ReviewFilter>([
 ]);
 
 export async function GET(req: NextRequest) {
-  const [{ userId }, clerkUser] = await Promise.all([auth(), currentUser()]);
-  if (!userId || !clerkUser) {
+  const supabaseUserId = await getSupabaseUserId();
+  if (!supabaseUserId) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-
-  const email = clerkUser.emailAddresses[0]?.emailAddress;
-  if (!email) return NextResponse.json({ error: "No email" }, { status: 400 });
-
   const supabase = createAdminClient();
-  const { data: user } = await supabase
-    .from("users")
-    .select("id")
-    .eq("email", email)
-    .single();
-
-  if (!user) return NextResponse.json({ error: "User not found" }, { status: 404 });
 
   const { searchParams } = new URL(req.url);
   const rawFilter = searchParams.get("filter") ?? "all";
@@ -35,6 +24,6 @@ export async function GET(req: NextRequest) {
     : "all";
   const limit = Math.min(Number(searchParams.get("limit") ?? "50"), 100);
 
-  const items = await fetchReviewItems(user.id as string, filter, limit);
+  const items = await fetchReviewItems(supabaseUserId, filter, limit);
   return NextResponse.json({ items, total: items.length });
 }

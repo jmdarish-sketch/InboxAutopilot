@@ -55,11 +55,12 @@ export async function GET(request: NextRequest) {
     // Fetch Gmail profile to get the connected address and historyId
     const gmailProfile = await getGmailProfile(tokens.access_token);
 
-    // Get Clerk user for their primary email (used to identify the user row)
+    // Get Clerk user for identity
     const clerkUser = await currentUser();
     const clerkEmail = clerkUser?.emailAddresses[0]?.emailAddress;
+    const clerkUserId = clerkUser?.id;
 
-    if (!clerkEmail) {
+    if (!clerkEmail || !clerkUserId) {
       return redirectWithError(request, "no_clerk_email");
     }
 
@@ -69,21 +70,57 @@ export async function GET(request: NextRequest) {
 
     const supabase = createAdminClient();
 
-    // Upsert the user row (creates it on first Gmail connect if not yet seeded)
-    const { data: userRow, error: userError } = await supabase
+    // Check if user already exists (by clerk_user_id or email)
+    const { data: existingUser } = await supabase
       .from("users")
-      .upsert(
-        {
+      .select("id")
+      .or(`clerk_user_id.eq.${clerkUserId},email.eq.${clerkEmail}`)
+      .maybeSingle();
+
+    let userRow: { id: string } | null;
+
+    if (existingUser) {
+      // Update existing user
+      const { data, error: updateError } = await supabase
+        .from("users")
+        .update({
+          clerk_user_id: clerkUserId,
           email: clerkEmail,
           gmail_connected: true,
           gmail_account_email: gmailProfile.emailAddress,
           onboarding_status: "gmail_connected",
           updated_at: new Date().toISOString(),
-        },
-        { onConflict: "email" }
-      )
-      .select("id")
-      .single();
+        })
+        .eq("id", existingUser.id)
+        .select("id")
+        .single();
+      userRow = data as { id: string } | null;
+      if (updateError) {
+        console.error("[gmail/callback] user update failed:", updateError);
+        return redirectWithError(request, "db_error");
+      }
+    } else {
+      // Create new user with clerk_user_id as the identity key
+      const { data, error: insertError } = await supabase
+        .from("users")
+        .insert({
+          clerk_user_id: clerkUserId,
+          email: clerkEmail,
+          gmail_connected: true,
+          gmail_account_email: gmailProfile.emailAddress,
+          onboarding_status: "gmail_connected",
+          updated_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      userRow = data as { id: string } | null;
+      if (insertError) {
+        console.error("[gmail/callback] user insert failed:", insertError);
+        return redirectWithError(request, "db_error");
+      }
+    }
+
+    const userError = !userRow;
 
     if (userError || !userRow) {
       console.error("[gmail/callback] user upsert failed:", userError);

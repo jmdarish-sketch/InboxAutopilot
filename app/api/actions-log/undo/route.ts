@@ -1,27 +1,14 @@
-import { auth, currentUser } from "@clerk/nextjs/server";
+import { getSupabaseUserId } from "@/lib/auth/get-user";
 import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient }         from "@/lib/supabase/admin";
 import { createGmailClient }         from "@/lib/gmail/client";
 
 export async function POST(req: NextRequest) {
-  const [{ userId }, clerkUser] = await Promise.all([auth(), currentUser()]);
-  if (!userId || !clerkUser) {
+  const supabaseUserId = await getSupabaseUserId();
+  if (!supabaseUserId) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-
-  const email = clerkUser.emailAddresses[0]?.emailAddress;
-  if (!email) return NextResponse.json({ error: "No email" }, { status: 400 });
-
   const supabase = createAdminClient();
-  const { data: user } = await supabase
-    .from("users")
-    .select("id")
-    .eq("email", email)
-    .single();
-
-  if (!user) return NextResponse.json({ error: "User not found" }, { status: 404 });
-
-  const supabaseUserId = user.id as string;
 
   let body: { actionId: string };
   try {

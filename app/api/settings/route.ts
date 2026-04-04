@@ -1,6 +1,6 @@
-import { auth, currentUser }      from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient }         from "@/lib/supabase/admin";
+import { getSupabaseUserId }         from "@/lib/auth/get-user";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -98,17 +98,14 @@ function mergePreferences(stored: unknown): UserPreferences {
 // ---------------------------------------------------------------------------
 
 async function resolveUser() {
-  const [{ userId }, clerkUser] = await Promise.all([auth(), currentUser()]);
-  if (!userId || !clerkUser) return null;
-
-  const email = clerkUser.emailAddresses[0]?.emailAddress;
-  if (!email) return null;
+  const supabaseUserId = await getSupabaseUserId();
+  if (!supabaseUserId) return null;
 
   const supabase = createAdminClient();
   const { data: user } = await supabase
     .from("users")
     .select("id, autopilot_mode, preferences")
-    .eq("email", email)
+    .eq("id", supabaseUserId)
     .single() as unknown as {
       data: {
         id:             string;

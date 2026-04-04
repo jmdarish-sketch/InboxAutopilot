@@ -1,6 +1,6 @@
-import { auth, currentUser } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse }  from "next/server";
 import { createAdminClient }          from "@/lib/supabase/admin";
+import { getSupabaseUserId }          from "@/lib/auth/get-user";
 import { archiveGmailMessages, attemptUnsubscribe } from "@/lib/gmail/actions";
 import { setSenderRule }              from "@/lib/senders/set-rule";
 
@@ -22,25 +22,12 @@ interface RequestBody {
 // ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
-  // Auth
-  const [{ userId }, clerkUser] = await Promise.all([auth(), currentUser()]);
-  if (!userId || !clerkUser) {
+  const supabaseUserId = await getSupabaseUserId();
+  if (!supabaseUserId) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const email = clerkUser.emailAddresses[0]?.emailAddress;
-  if (!email) return NextResponse.json({ error: "No email" }, { status: 400 });
-
   const supabase = createAdminClient();
-  const { data: user } = await supabase
-    .from("users")
-    .select("id")
-    .eq("email", email)
-    .single();
-
-  if (!user) return NextResponse.json({ error: "User not found" }, { status: 404 });
-
-  const supabaseUserId = user.id as string;
 
   // Parse body
   let body: RequestBody;
@@ -92,8 +79,9 @@ export async function POST(req: NextRequest) {
       }
 
       // 3. Attempt unsubscribe if requested
+      let unsubscribeResult: { attempted: boolean; method: string; success: boolean } = { attempted: false, method: "none", success: false };
       if (sel.action === "unsubscribe_and_archive") {
-        await attemptUnsubscribe(supabaseUserId, sel.senderId);
+        unsubscribeResult = await attemptUnsubscribe(supabaseUserId, sel.senderId);
       }
 
       // 4. Log the action
@@ -103,7 +91,10 @@ export async function POST(req: NextRequest) {
         action_type:  sel.action === "unsubscribe_and_archive" ? "unsubscribe" : "archive",
         action_source: "initial_cleanup",
         status:       "succeeded",
-        metadata:     { archived_count: archived },
+        metadata:     {
+          archived_count: archived,
+          ...(sel.action === "unsubscribe_and_archive" ? { unsubscribe: unsubscribeResult } : {}),
+        },
       });
 
       // 5. Create sender rule so autopilot knows to keep archiving
