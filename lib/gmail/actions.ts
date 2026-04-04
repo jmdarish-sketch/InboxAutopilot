@@ -1,9 +1,85 @@
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createGmailClient } from "./client";
+import type { GmailClient }  from "./client";
+
+// ---------------------------------------------------------------------------
+// Autopilot label management
+// ---------------------------------------------------------------------------
+
+const AUTOPILOT_LABEL_NAME = "Autopilot/Archived";
+
+interface GmailLabel {
+  id:   string;
+  name: string;
+}
 
 /**
- * Archives a list of Gmail messages by removing the INBOX label.
- * Uses batchModify for efficiency (up to 1000 per request).
+ * Returns the Gmail label ID for "Autopilot/Archived", creating it if needed.
+ * Caches the ID in gmail_accounts.autopilot_label_id to avoid repeated lookups.
+ */
+async function getOrCreateAutopilotLabel(
+  client: GmailClient,
+  supabaseUserId: string
+): Promise<string> {
+  const supabase = createAdminClient();
+
+  // 1. Check cache
+  const { data: account } = await supabase
+    .from("gmail_accounts")
+    .select("autopilot_label_id")
+    .eq("user_id", supabaseUserId)
+    .single() as unknown as { data: { autopilot_label_id: string | null } | null };
+
+  if (account?.autopilot_label_id) {
+    return account.autopilot_label_id;
+  }
+
+  // 2. List existing labels to see if it already exists in Gmail
+  const listResult = await client.get<{ labels?: GmailLabel[] }>(
+    "/gmail/v1/users/me/labels"
+  );
+
+  const existing = (listResult.labels ?? []).find(
+    l => l.name === AUTOPILOT_LABEL_NAME
+  );
+
+  if (existing) {
+    await cacheLabelId(supabase, supabaseUserId, existing.id);
+    return existing.id;
+  }
+
+  // 3. Create the label
+  const created = await client.post<GmailLabel>(
+    "/gmail/v1/users/me/labels",
+    {
+      name: AUTOPILOT_LABEL_NAME,
+      labelListVisibility:   "labelShow",
+      messageListVisibility: "show",
+    }
+  );
+
+  await cacheLabelId(supabase, supabaseUserId, created.id);
+  return created.id;
+}
+
+async function cacheLabelId(
+  supabase: ReturnType<typeof createAdminClient>,
+  supabaseUserId: string,
+  labelId: string
+): Promise<void> {
+  await supabase
+    .from("gmail_accounts")
+    .update({ autopilot_label_id: labelId, updated_at: new Date().toISOString() })
+    .eq("user_id", supabaseUserId);
+}
+
+// ---------------------------------------------------------------------------
+// Archive messages
+// ---------------------------------------------------------------------------
+
+/**
+ * Archives a list of Gmail messages by removing the INBOX label and adding
+ * the "Autopilot/Archived" label so users can find them in Gmail's sidebar.
  */
 export async function archiveGmailMessages(
   supabaseUserId: string,
@@ -11,7 +87,20 @@ export async function archiveGmailMessages(
 ): Promise<void> {
   if (gmailMessageIds.length === 0) return;
   const client = await createGmailClient(supabaseUserId);
-  await client.batchModifyLabels(gmailMessageIds, undefined, ["INBOX"]);
+
+  let labelId: string | undefined;
+  try {
+    labelId = await getOrCreateAutopilotLabel(client, supabaseUserId);
+  } catch (err) {
+    // Label creation failed — archive without the label rather than failing entirely
+    console.warn("[gmail] Failed to get/create Autopilot label, archiving without it:", err);
+  }
+
+  await client.batchModifyLabels(
+    gmailMessageIds,
+    labelId ? [labelId] : undefined,
+    ["INBOX"]
+  );
 }
 
 export interface UnsubscribeResult {
