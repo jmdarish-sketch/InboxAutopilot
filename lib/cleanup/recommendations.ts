@@ -88,13 +88,16 @@ export async function buildCleanupRecommendations(
     supabase
       .from("senders")
       .select(
-        "id, sender_email, sender_name, sender_domain, message_count, open_count, clutter_score, importance_score, restore_count"
+        "id, sender_email, sender_name, sender_domain, message_count, open_count, clutter_score, importance_score, restore_count, learned_state"
       )
       .eq("user_id", supabaseUserId)
       .gte("clutter_score", 70)
       .lte("importance_score", 35)
       .gte("message_count", 3)
       .eq("restore_count", 0)
+      // Exclude senders already handled by auto-cleanup
+      .neq("learned_state", "always_archive")
+      .neq("learned_state", "always_keep")
       .order("message_count", { ascending: false })
       .limit(25),
 
@@ -128,20 +131,41 @@ export async function buildCleanupRecommendations(
 
   const senderIds = clutter.map(s => s.id);
 
-  // Parallel enrichment
+  // First check which senders still have unarchived messages
+  const { data: unarchivedCounts } = await supabase
+    .from("messages")
+    .select("sender_id")
+    .eq("user_id", supabaseUserId)
+    .in("sender_id", senderIds)
+    .eq("action_status", "none");
+
+  const sendersWithUnarchived = new Set(
+    (unarchivedCounts ?? []).map(m => m.sender_id)
+  );
+
+  // Filter to only senders that still have work to do
+  const activeSenderIds = senderIds.filter(id => sendersWithUnarchived.has(id));
+
+  if (activeSenderIds.length === 0) {
+    return { recommendations: [], protected: protectedSenders };
+  }
+
+  // Parallel enrichment — only count unarchived messages
   const [recentResult, unsubResult, subjectsResult] = await Promise.all([
     supabase
       .from("messages")
       .select("sender_id")
       .eq("user_id", supabaseUserId)
-      .in("sender_id", senderIds)
+      .in("sender_id", activeSenderIds)
+      .eq("action_status", "none")
       .gte("internal_date", new Date(Date.now() - 30 * 86400_000).toISOString()),
 
     supabase
       .from("messages")
       .select("sender_id")
       .eq("user_id", supabaseUserId)
-      .in("sender_id", senderIds)
+      .in("sender_id", activeSenderIds)
+      .eq("action_status", "none")
       .not("unsubscribe_url", "is", null)
       .limit(500),
 
@@ -149,7 +173,8 @@ export async function buildCleanupRecommendations(
       .from("messages")
       .select("sender_id, subject")
       .eq("user_id", supabaseUserId)
-      .in("sender_id", senderIds)
+      .in("sender_id", activeSenderIds)
+      .eq("action_status", "none")
       .not("subject", "is", null)
       .order("internal_date", { ascending: false })
       .limit(200),
@@ -174,6 +199,8 @@ export async function buildCleanupRecommendations(
 
   const recommendations: CleanupRecommendation[] = clutter
     .filter(s => {
+      // Only include senders that still have unarchived messages
+      if (!sendersWithUnarchived.has(s.id)) return false;
       // Safety: skip senders with meaningful open rate (>15%)
       const openRate = s.message_count > 0 ? s.open_count / s.message_count : 0;
       return openRate <= 0.15;

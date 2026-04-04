@@ -314,22 +314,66 @@ export default function CleanupReview({
     }
   }
 
-  // Empty state
-  if (recommendations.length === 0 && protectedSenders.length === 0) {
+  // Empty state — no recommendations to review (auto-cleanup may have handled everything)
+  if (recommendations.length === 0) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-gray-50 px-4">
-        <div className="w-full max-w-md rounded-2xl bg-white p-8 text-center shadow-sm ring-1 ring-gray-100">
-          <p className="text-4xl">✅</p>
-          <h2 className="mt-4 text-xl font-bold text-gray-900">Your inbox looks clean!</h2>
-          <p className="mt-2 text-sm text-gray-500">
-            No high-confidence cleanup opportunities were found. Let&apos;s set up autopilot.
-          </p>
-          <button
-            onClick={() => router.push("/onboarding/autopilot")}
-            className="mt-6 w-full rounded-xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white hover:bg-blue-700"
-          >
-            Set up autopilot
-          </button>
+        <div className="w-full max-w-lg">
+          <div className="rounded-2xl bg-white p-8 text-center shadow-sm ring-1 ring-gray-100">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-emerald-50">
+              <svg className="h-7 w-7 text-emerald-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 12.75 6 6 9-13.5" />
+              </svg>
+            </div>
+            <h2 className="mt-5 text-xl font-bold text-gray-900">Your inbox is already clean!</h2>
+            <p className="mt-2 text-sm text-gray-500">
+              The auto-cleanup handled the obvious junk. No additional cleanup decisions are needed right now.
+            </p>
+            <button
+              onClick={() => {
+                // Advance onboarding status since we're skipping manual cleanup
+                void fetch("/api/onboarding/apply-cleanup", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ selections: [] }),
+                }).then(() => {
+                  router.push("/onboarding/autopilot");
+                });
+              }}
+              className="mt-6 w-full rounded-xl bg-blue-600 px-4 py-3.5 text-sm font-semibold text-white shadow-sm hover:bg-blue-700"
+            >
+              Continue to Autopilot Setup
+            </button>
+          </div>
+
+          {/* Still show protected senders for trust */}
+          {protectedSenders.length > 0 && (
+            <div className="mt-8">
+              <h3 className="mb-3 text-sm font-semibold text-gray-700">Protected senders</h3>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {protectedSenders.map(s => (
+                  <div
+                    key={s.id}
+                    className="flex items-start gap-3 rounded-xl border border-gray-100 bg-white p-4"
+                  >
+                    <span className="mt-0.5 text-lg leading-none" aria-hidden="true">
+                      {s.reasonIcon}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium text-gray-900">
+                        {s.senderName ?? s.senderEmail}
+                      </p>
+                      <p className="truncate text-xs text-gray-400">{s.senderEmail}</p>
+                      <p className="mt-0.5 text-xs font-medium text-gray-500">{s.protectionReason}</p>
+                    </div>
+                    <span className="ml-auto shrink-0 rounded-full bg-green-50 px-2 py-0.5 text-xs font-semibold text-green-700">
+                      Protected
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
