@@ -267,6 +267,61 @@ export async function computeRecentEngagementBoost(
 //      d. Write the resulting scores back to the senders table.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// computeBehaviorScore
+//
+// Computes a single behavior score from sender engagement counters.
+// Positive = user cares, negative = user ignores.
+//
+// Returns the numeric score AND the recommended learned_state transition.
+// ---------------------------------------------------------------------------
+
+export interface BehaviorScoreResult {
+  score:          number;
+  recommendedState: string;
+  previousState:    string;
+  crossed:          boolean; // true if state actually changed
+}
+
+export function computeBehaviorScore(sender: {
+  open_count:     number;
+  reply_count:    number;
+  restore_count:  number;
+  ignore_count:   number;
+  archive_count:  number;
+  learned_state:  string;
+}): BehaviorScoreResult {
+  const score =
+    (sender.open_count    * 3)  +
+    (sender.reply_count   * 5)  +
+    (sender.restore_count * 4)  +
+    (sender.ignore_count  * -1) +
+    (sender.archive_count * -1);
+
+  let recommendedState: string;
+  if (score < -15)       recommendedState = "always_archive";
+  else if (score < -5)   recommendedState = "prefer_archive";
+  else if (score <= 5)   recommendedState = "unknown";
+  else if (score <= 20)  recommendedState = "prefer_keep";
+  else                   recommendedState = "always_keep";
+
+  // Don't demote hard user overrides
+  const isHardOverride =
+    sender.learned_state === "always_keep" ||
+    sender.learned_state === "always_archive";
+
+  return {
+    score,
+    recommendedState: isHardOverride ? sender.learned_state : recommendedState,
+    previousState:    sender.learned_state,
+    crossed:          !isHardOverride && recommendedState !== sender.learned_state,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// recordFeedbackAndRetrain  (§3.14 + §7.5)
+// ---------------------------------------------------------------------------
+
 export async function recordFeedbackAndRetrain(
   supabaseUserId: string,
   eventType:      string,

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse }   from "next/server";
 import { createAdminClient }           from "@/lib/supabase/admin";
 import { getSupabaseUserId }           from "@/lib/auth/get-user";
-import { archiveGmailMessages, attemptUnsubscribe } from "@/lib/gmail/actions";
+import { archiveGmailMessages, attemptUnsubscribe, createGmailFilter } from "@/lib/gmail/actions";
 import { recordFeedbackAndRetrain }    from "@/lib/review/learning";
 import { setSenderRule }               from "@/lib/senders/set-rule";
 
@@ -159,6 +159,13 @@ export async function POST(req: NextRequest) {
 
       if (senderId) {
         await setSenderRule(supabaseUserId, senderId, "always_archive", "user_manual");
+        // Create Gmail filter for preventative blocking
+        if (msg?.gmail_message_id) {
+          const senderEmail = await getSenderEmail(supabase, supabaseUserId, senderId);
+          if (senderEmail) {
+            await createGmailFilter(supabaseUserId, senderEmail);
+          }
+        }
       }
 
       await recordFeedbackAndRetrain(supabaseUserId, "sender_archive_forever", {
@@ -206,4 +213,18 @@ export async function POST(req: NextRequest) {
   }
 
   return NextResponse.json({ success: true });
+}
+
+async function getSenderEmail(
+  supabase: ReturnType<typeof createAdminClient>,
+  userId: string,
+  senderId: string
+): Promise<string | null> {
+  const { data } = await supabase
+    .from("senders")
+    .select("sender_email")
+    .eq("id", senderId)
+    .eq("user_id", userId)
+    .single() as unknown as { data: { sender_email: string } | null };
+  return data?.sender_email ?? null;
 }

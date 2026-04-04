@@ -7,6 +7,9 @@ import { scoreMessage }                   from "@/lib/classification/scorer";
 import { shouldUseLLM, classifyWithLLM }  from "@/lib/classification/llm";
 import { resolveFinalClassification }     from "@/lib/classification/final-decision";
 import { decideAutopilotExecution }       from "@/lib/autopilot/policy";
+import { computeBehaviorScore }           from "@/lib/autopilot/learning";
+import { createGmailFilter }             from "@/lib/gmail/actions";
+import { setSenderRule }                  from "@/lib/senders/set-rule";
 import type { AutopilotMode }             from "@/lib/autopilot/policy";
 import type { NormalizedMessage }         from "@/lib/gmail/types";
 
@@ -266,6 +269,73 @@ export async function runAutopilot(supabaseUserId: string): Promise<{
     } catch (msgErr) {
       console.error("[autopilot] error processing message", msg.gmail_message_id, msgErr);
       // Continue to next message — one failure shouldn't halt the whole run
+    }
+  }
+
+  // ── 4. Automatic rule promotion — check if any senders crossed thresholds ──
+  //    Collect unique sender IDs from this batch
+  const processedSenderIds = new Set<string>();
+  for (const msg of newMessages) {
+    if (msg.sender_email) {
+      const { data: s } = await supabase
+        .from("senders")
+        .select("id")
+        .eq("user_id", supabaseUserId)
+        .eq("sender_email", msg.sender_email)
+        .maybeSingle() as unknown as { data: { id: string } | null };
+      if (s) processedSenderIds.add(s.id);
+    }
+  }
+
+  for (const senderId of processedSenderIds) {
+    try {
+      const { data: senderRow } = await supabase
+        .from("senders")
+        .select("id, sender_email, open_count, reply_count, restore_count, ignore_count, archive_count, learned_state, message_count")
+        .eq("id", senderId)
+        .single() as unknown as {
+          data: {
+            id: string; sender_email: string;
+            open_count: number; reply_count: number; restore_count: number;
+            ignore_count: number; archive_count: number;
+            learned_state: string; message_count: number;
+          } | null;
+        };
+
+      if (!senderRow || senderRow.message_count < 5) continue; // need enough data
+
+      const result = computeBehaviorScore(senderRow);
+
+      if (result.crossed) {
+        // Update sender learned_state
+        await supabase
+          .from("senders")
+          .update({ learned_state: result.recommendedState, updated_at: new Date().toISOString() })
+          .eq("id", senderId);
+
+        // If promoted to always_archive, create a Gmail filter
+        if (result.recommendedState === "always_archive") {
+          await setSenderRule(supabaseUserId, senderId, "always_archive", "system_learned");
+
+          const filterResult = await createGmailFilter(supabaseUserId, senderRow.sender_email);
+
+          await supabase.from("actions_log").insert({
+            user_id:       supabaseUserId,
+            sender_id:     senderId,
+            action_type:   "gmail_filter_created",
+            action_source: "system_learned",
+            status:        filterResult.created ? "succeeded" : "failed",
+            reason:        `behavior_score=${result.score}, promoted from ${result.previousState}`,
+            metadata:      { behavior_score: result.score, filter_id: filterResult.filterId },
+          });
+
+          console.log(
+            `[autopilot] Auto-promoted ${senderRow.sender_email} to always_archive (score=${result.score})`
+          );
+        }
+      }
+    } catch (err) {
+      console.error(`[autopilot] promotion check failed for sender ${senderId}:`, err);
     }
   }
 

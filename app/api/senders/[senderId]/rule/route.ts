@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse }    from "next/server";
 import { createAdminClient }            from "@/lib/supabase/admin";
 import { getSupabaseUserId }            from "@/lib/auth/get-user";
-import { attemptUnsubscribe }           from "@/lib/gmail/actions";
+import { attemptUnsubscribe, createGmailFilter } from "@/lib/gmail/actions";
 import { recordFeedbackAndRetrain }     from "@/lib/review/learning";
 import { setSenderRule }                from "@/lib/senders/set-rule";
 
@@ -77,6 +77,22 @@ export async function POST(
         reason:        action,
       });
 
+      // Create Gmail filter for always_archive so Gmail itself prevents future inbox delivery
+      if (action === "always_archive") {
+        const filterResult = await createGmailFilter(supabaseUserId, sender.sender_email as string);
+        if (filterResult.created) {
+          await supabase.from("actions_log").insert({
+            user_id:       supabaseUserId,
+            sender_id:     senderId,
+            action_type:   "gmail_filter_created",
+            action_source: "user_manual",
+            status:        "succeeded",
+            reason:        "user_always_archive",
+            metadata:      { filter_id: filterResult.filterId },
+          });
+        }
+      }
+
       const feedbackEvent = FEEDBACK_MAP[action];
       if (feedbackEvent) {
         await recordFeedbackAndRetrain(supabaseUserId, feedbackEvent, { senderId });
@@ -88,6 +104,7 @@ export async function POST(
     case "try_unsubscribe": {
       const unsubResult = await attemptUnsubscribe(supabaseUserId, senderId);
       await setSenderRule(supabaseUserId, senderId, "always_archive", "user_manual");
+      await createGmailFilter(supabaseUserId, sender.sender_email as string);
 
       await supabase.from("actions_log").insert({
         user_id:       supabaseUserId,

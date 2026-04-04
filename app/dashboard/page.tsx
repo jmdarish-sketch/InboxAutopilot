@@ -2,8 +2,8 @@ import { auth, currentUser } from "@clerk/nextjs/server";
 import { redirect }          from "next/navigation";
 import Link                  from "next/link";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { fetchDashboardSummary } from "@/lib/dashboard/queries";
-import type { ImportantInboxItem } from "@/lib/dashboard/queries";
+import { fetchDashboardSummary, fetchAutopilotIntelligence } from "@/lib/dashboard/queries";
+import type { ImportantInboxItem, AutopilotIntelligence } from "@/lib/dashboard/queries";
 import { fetchHandledActions }   from "@/lib/dashboard/handledQueries";
 import ReviewQueuePreview    from "@/components/dashboard/ReviewQueuePreview";
 import RecentActionsFeed     from "@/components/dashboard/RecentActionsFeed";
@@ -29,12 +29,13 @@ async function getDashboardData() {
 
   if (!user) redirect("/connect-gmail");
 
-  const [summary, recentActions] = await Promise.all([
+  const [summary, recentActions, intelligence] = await Promise.all([
     fetchDashboardSummary(user.id as string),
     fetchHandledActions(user.id as string, "all", 10),
+    fetchAutopilotIntelligence(user.id as string),
   ]);
 
-  return { ...summary, recentActions };
+  return { ...summary, recentActions, intelligence };
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +146,7 @@ function ImportantCard({ item }: { item: ImportantInboxItem }) {
 // ---------------------------------------------------------------------------
 
 export default async function DashboardPage() {
-  const { stats, reviewPreview, importantInbox, recentActions } =
+  const { stats, reviewPreview, importantInbox, recentActions, intelligence } =
     await getDashboardData();
 
   return (
@@ -197,6 +198,70 @@ export default async function DashboardPage() {
             tooltip="Emails classified as important in your inbox"
           />
         </section>
+
+        {/* Autopilot Intelligence */}
+        {(intelligence.blockedThisWeek > 0 || intelligence.autoArchiveSenders > 0 || intelligence.recentPromotions.length > 0) && (
+          <section>
+            <div className="mb-4">
+              <h2 className="text-lg font-semibold text-gray-900">Autopilot intelligence</h2>
+              <p className="mt-0.5 text-sm text-gray-400">
+                How your autopilot is learning and improving.
+              </p>
+            </div>
+            <div className="overflow-hidden rounded-2xl border border-gray-100 bg-white">
+              {/* Stats row */}
+              <div className="flex divide-x divide-gray-100 border-b border-gray-50">
+                <div className="flex-1 px-5 py-4">
+                  <p className="text-2xl font-bold tabular-nums text-gray-900">
+                    {intelligence.blockedThisWeek}
+                  </p>
+                  <p className="mt-0.5 text-xs text-gray-500">
+                    emails blocked this week
+                  </p>
+                </div>
+                <div className="flex-1 px-5 py-4">
+                  <p className="text-2xl font-bold tabular-nums text-gray-900">
+                    {intelligence.autoArchiveSenders}
+                  </p>
+                  <p className="mt-0.5 text-xs text-gray-500">
+                    senders auto-archiving
+                  </p>
+                </div>
+              </div>
+
+              {/* Recent promotions */}
+              {intelligence.recentPromotions.length > 0 && (
+                <div className="px-5 py-4">
+                  <p className="mb-3 text-xs font-medium uppercase tracking-wide text-gray-400">
+                    Recent automatic actions
+                  </p>
+                  <div className="space-y-2.5">
+                    {intelligence.recentPromotions.map((p, i) => (
+                      <div key={i} className="flex items-start gap-3">
+                        <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-50">
+                          <svg className="h-3 w-3 text-emerald-600" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 12.75 6 6 9-13.5" />
+                          </svg>
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm text-gray-900">
+                            Started blocking emails from{" "}
+                            <span className="font-medium">{p.senderName ?? p.senderEmail}</span>
+                          </p>
+                          {p.reason && (
+                            <p className="mt-0.5 text-xs text-gray-400">
+                              {p.reason.replace(/_/g, " ")}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
 
         {/* Review queue preview */}
         <section>

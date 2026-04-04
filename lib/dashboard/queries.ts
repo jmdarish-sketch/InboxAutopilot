@@ -317,3 +317,87 @@ export async function fetchDashboardSummary(
     recentActions,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Autopilot Intelligence stats
+// ---------------------------------------------------------------------------
+
+export interface AutopilotIntelligence {
+  blockedThisWeek:       number;
+  autoArchiveSenders:    number;
+  recentPromotions:      Array<{
+    senderEmail: string;
+    senderName:  string | null;
+    reason:      string | null;
+    createdAt:   string;
+  }>;
+}
+
+export async function fetchAutopilotIntelligence(
+  supabaseUserId: string
+): Promise<AutopilotIntelligence> {
+  const supabase = createAdminClient();
+  const weekAgo  = new Date(Date.now() - 7 * 86_400_000).toISOString();
+
+  const [blockedRes, autoArchiveRes, promotionsRes] = await Promise.all([
+    // Emails blocked (archived by autopilot) this week
+    supabase
+      .from("actions_log")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", supabaseUserId)
+      .eq("action_type", "archive")
+      .eq("action_source", "system_autopilot")
+      .eq("status", "succeeded")
+      .gte("created_at", weekAgo),
+
+    // Senders currently in always_archive state
+    supabase
+      .from("senders")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", supabaseUserId)
+      .eq("learned_state", "always_archive"),
+
+    // Recent automatic promotions (system_learned filter creations)
+    supabase
+      .from("actions_log")
+      .select("sender_id, reason, created_at")
+      .eq("user_id", supabaseUserId)
+      .eq("action_type", "gmail_filter_created")
+      .eq("action_source", "system_learned")
+      .order("created_at", { ascending: false })
+      .limit(5),
+  ]);
+
+  // Enrich promotions with sender info
+  const promotionRows = promotionsRes.data ?? [];
+  const senderIds = [...new Set(
+    promotionRows.map(p => p.sender_id).filter((id): id is string => !!id)
+  )];
+
+  let senderMap = new Map<string, { sender_name: string | null; sender_email: string }>();
+  if (senderIds.length > 0) {
+    const { data: senders } = await supabase
+      .from("senders")
+      .select("id, sender_name, sender_email")
+      .in("id", senderIds) as unknown as {
+        data: Array<{ id: string; sender_name: string | null; sender_email: string }> | null;
+      };
+    if (senders) {
+      senderMap = new Map(senders.map(s => [s.id, s]));
+    }
+  }
+
+  return {
+    blockedThisWeek:    blockedRes.count ?? 0,
+    autoArchiveSenders: autoArchiveRes.count ?? 0,
+    recentPromotions:   promotionRows.map(p => {
+      const sender = p.sender_id ? senderMap.get(p.sender_id) : null;
+      return {
+        senderEmail: sender?.sender_email ?? "unknown",
+        senderName:  sender?.sender_name ?? null,
+        reason:      p.reason ?? null,
+        createdAt:   p.created_at,
+      };
+    }),
+  };
+}
