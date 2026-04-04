@@ -105,15 +105,15 @@ function ProgressBar({ pct }: { pct: number }) {
 // ---------------------------------------------------------------------------
 
 const STAGE_LABELS: Record<ScanProgressData["stage"], string> = {
-  listing:    "Listing",
-  processing: "Analyzing",
-  finalizing: "Saving",
-  complete:   "Complete",
-  error:      "Error",
+  listing:       "Listing",
+  processing:    "Analyzing",
+  auto_cleaning: "Cleaning",
+  complete:      "Complete",
+  error:         "Error",
 };
 
 const STAGE_ORDER: ScanProgressData["stage"][] = [
-  "listing", "processing", "finalizing", "complete",
+  "listing", "processing", "auto_cleaning", "complete",
 ];
 
 function StageIndicator({ current }: { current: ScanProgressData["stage"] }) {
@@ -174,6 +174,8 @@ export default function ScanProgress() {
     sendersFound:     0,
     clutterDetected:  0,
     protectedSenders: 0,
+    autoArchived:     0,
+    autoArchivedSenders: 0,
     message:          "Connecting to Gmail…",
   });
 
@@ -181,6 +183,7 @@ export default function ScanProgress() {
   const cancelledRef            = useRef(false);
   const consecutiveErrorsRef    = useRef(0);
   const timerRef                = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const phaseRef                = useRef<"scan" | "cleanup">("scan");
 
   useEffect(() => {
     cancelledRef.current = false;
@@ -189,7 +192,12 @@ export default function ScanProgress() {
       if (cancelledRef.current) return;
 
       try {
-        const res = await fetch("/api/scan/start", { method: "POST" });
+        // Choose endpoint based on current phase
+        const endpoint = phaseRef.current === "cleanup"
+          ? "/api/scan/auto-cleanup"
+          : "/api/scan/start";
+
+        const res = await fetch(endpoint, { method: "POST" });
 
         if (!res.ok) {
           const data = await res.json().catch(() => ({})) as { error?: string; detail?: string };
@@ -198,19 +206,39 @@ export default function ScanProgress() {
         }
 
         const progress = (await res.json()) as ScanProgressData;
-        consecutiveErrorsRef.current = 0; // reset on success
-        setStats(progress);
+        consecutiveErrorsRef.current = 0;
+
+        // Merge auto-cleanup response into full stats
+        if (phaseRef.current === "cleanup") {
+          setStats(prev => ({
+            ...prev,
+            stage:               progress.stage as ScanProgressData["stage"],
+            autoArchived:        progress.autoArchived ?? 0,
+            autoArchivedSenders: progress.autoArchivedSenders ?? 0,
+            message:             progress.message,
+          }));
+        } else {
+          setStats(progress);
+        }
 
         if (progress.stage === "error") {
           setErrorMsg(progress.message);
-          return; // stop polling
+          return;
+        }
+
+        // When scan processing finishes, switch to auto-cleanup phase
+        if (progress.stage === "auto_cleaning" && phaseRef.current === "scan") {
+          phaseRef.current = "cleanup";
+          if (!cancelledRef.current) {
+            timerRef.current = setTimeout(poll, 500); // quick follow-up
+          }
+          return;
         }
 
         if (progress.stage === "complete") {
-          return; // stop polling
+          return;
         }
 
-        // Schedule next poll
         if (!cancelledRef.current) {
           timerRef.current = setTimeout(poll, POLL_INTERVAL);
         }
@@ -220,10 +248,9 @@ export default function ScanProgress() {
 
         if (consecutiveErrorsRef.current >= MAX_CONSECUTIVE_ERRORS) {
           setErrorMsg(err instanceof Error ? err.message : "Connection lost. Please refresh and try again.");
-          return; // stop polling
+          return;
         }
 
-        // Retry with backoff
         if (!cancelledRef.current) {
           timerRef.current = setTimeout(poll, POLL_INTERVAL * consecutiveErrorsRef.current);
         }
@@ -292,7 +319,7 @@ export default function ScanProgress() {
         </div>
 
         {/* Stat cards */}
-        <div className="mb-8 grid grid-cols-2 gap-3">
+        <div className="mb-4 grid grid-cols-2 gap-3">
           <StatCard
             label="Emails scanned"
             value={stats.emailsScanned}
@@ -318,6 +345,29 @@ export default function ScanProgress() {
             variant="protected"
           />
         </div>
+
+        {/* Auto-cleanup live counter */}
+        {(stats.stage === "auto_cleaning" || (isComplete && stats.autoArchived > 0)) && (
+          <div className="mb-8 rounded-2xl border border-emerald-200 bg-emerald-50 px-5 py-4">
+            <div className="flex items-center gap-3">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-100">
+                <svg className="h-4 w-4 text-emerald-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 12.75 6 6 9-13.5" />
+                </svg>
+              </span>
+              <div>
+                <p className="text-sm font-semibold text-emerald-900">
+                  Auto-archived {stats.autoArchived.toLocaleString()} obvious junk email{stats.autoArchived !== 1 ? "s" : ""} from {stats.autoArchivedSenders} sender{stats.autoArchivedSenders !== 1 ? "s" : ""}
+                </p>
+                <p className="mt-0.5 text-xs text-emerald-700">
+                  {isComplete
+                    ? "These were spam, promotions, and newsletters you never opened."
+                    : "Removing obvious spam, promotions, and newsletters you never open…"}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* CTA */}
         {isComplete ? (

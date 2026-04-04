@@ -16,12 +16,14 @@ export const dynamic = "force-dynamic";
 // ---------------------------------------------------------------------------
 
 export interface ScanProgress {
-  stage:            "listing" | "processing" | "finalizing" | "complete" | "error";
+  stage:            "listing" | "processing" | "auto_cleaning" | "complete" | "error";
   emailsScanned:    number;
   emailsTotal:      number;
   sendersFound:     number;
   clutterDetected:  number;
   protectedSenders: number;
+  autoArchived:     number;
+  autoArchivedSenders: number;
   message:          string;
 }
 
@@ -142,6 +144,8 @@ export async function POST() {
         sendersFound:     0,
         clutterDetected:  0,
         protectedSenders: 0,
+        autoArchived:     0,
+        autoArchivedSenders: 0,
         message:          ids.length > 0
           ? `Found ${ids.length.toLocaleString()} emails — analyzing…`
           : "No recent emails found.",
@@ -202,6 +206,8 @@ export async function POST() {
           sendersFound:     state.sendersFound,
           clutterDetected:  state.clutterDetected,
           protectedSenders: state.protectedSenders,
+          autoArchived:     0,
+          autoArchivedSenders: 0,
           message:          `Analyzed ${newCursor.toLocaleString()} of ${total.toLocaleString()} emails…`,
         } satisfies ScanProgress);
       }
@@ -433,6 +439,8 @@ export async function POST() {
         sendersFound:     updatedState.sendersFound,
         clutterDetected:  updatedState.clutterDetected,
         protectedSenders: updatedState.protectedSenders,
+        autoArchived:     0,
+        autoArchivedSenders: 0,
         message:          `Analyzed ${newCursor.toLocaleString()} of ${total.toLocaleString()} emails…`,
       };
 
@@ -452,6 +460,8 @@ export async function POST() {
       sendersFound:     ss?.sendersFound ?? 0,
       clutterDetected:  ss?.clutterDetected ?? 0,
       protectedSenders: ss?.protectedSenders ?? 0,
+      autoArchived:     0,
+      autoArchivedSenders: 0,
       message:          err instanceof Error ? err.message : "Something went wrong. Please try again.",
     };
     return NextResponse.json(progress, { status: 500 });
@@ -477,33 +487,29 @@ async function finalize(
   state: ScanState,
   total: number,
 ) {
-  await Promise.all([
-    supabase
-      .from("gmail_accounts")
-      .update({
-        scan_state:        null,
-        sync_status:       "synced",
-        last_full_sync_at: new Date().toISOString(),
-        updated_at:        new Date().toISOString(),
-      })
-      .eq("id", gmailAccountId),
-    supabase
-      .from("users")
-      .update({
-        onboarding_status: "initial_scan_complete",
-        updated_at:        new Date().toISOString(),
-      })
-      .eq("id", supabaseUserId),
-  ]);
+  // Clear scan_state but set sync_status to "auto_cleaning" so the
+  // auto-cleanup endpoint knows to run. Don't advance onboarding_status yet.
+  await supabase
+    .from("gmail_accounts")
+    .update({
+      scan_state:        null,
+      sync_status:       "auto_cleaning",
+      last_full_sync_at: new Date().toISOString(),
+      updated_at:        new Date().toISOString(),
+    })
+    .eq("id", gmailAccountId);
 
+  // Return auto_cleaning stage — client will now poll the auto-cleanup endpoint
   const progress: ScanProgress = {
-    stage:            "complete",
+    stage:            "auto_cleaning",
     emailsScanned:    total,
     emailsTotal:      total,
     sendersFound:     state.sendersFound,
     clutterDetected:  state.clutterDetected,
     protectedSenders: state.protectedSenders,
-    message:          "Your inbox is ready.",
+    autoArchived:     0,
+    autoArchivedSenders: 0,
+    message:          "Cleaning obvious junk…",
   };
 
   return NextResponse.json(progress);

@@ -15,7 +15,12 @@ import type {
 // Page data loader
 // ---------------------------------------------------------------------------
 
-async function getDiagnosis(): Promise<{ supabaseUserId: string; diagnosis: InboxDiagnosis }> {
+async function getDiagnosis(): Promise<{
+  supabaseUserId: string;
+  diagnosis: InboxDiagnosis;
+  autoCleaned: number;
+  autoCleanedSenders: number;
+}> {
   const [{ userId }, clerkUser] = await Promise.all([auth(), currentUser()]);
   if (!userId || !clerkUser) redirect("/sign-in");
 
@@ -40,7 +45,29 @@ async function getDiagnosis(): Promise<{ supabaseUserId: string; diagnosis: Inbo
   await updateSenderAggregates(supabaseUserId);
 
   const diagnosis = await computeInboxDiagnosis(supabaseUserId);
-  return { supabaseUserId, diagnosis };
+
+  // Check if auto-cleanup ran during onboarding
+  const { count: autoCleanedCount } = await supabase
+    .from("actions_log")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", supabaseUserId)
+    .eq("action_source", "initial_cleanup_auto")
+    .eq("action_type", "archive")
+    .eq("status", "succeeded");
+
+  const { count: autoCleanedSenders } = await supabase
+    .from("actions_log")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", supabaseUserId)
+    .eq("action_source", "initial_cleanup_auto")
+    .eq("action_type", "archive");
+
+  return {
+    supabaseUserId,
+    diagnosis,
+    autoCleaned: autoCleanedCount ?? 0,
+    autoCleanedSenders: autoCleanedSenders ?? 0,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -281,19 +308,44 @@ function ProtectedSendersList({ senders }: { senders: ProtectedSender[] }) {
 // ---------------------------------------------------------------------------
 
 export default async function DiagnosisPage() {
-  const { diagnosis: d } = await getDiagnosis();
+  const { diagnosis: d, autoCleaned, autoCleanedSenders } = await getDiagnosis();
   const { summary: s }   = d;
 
   return (
     <div className="min-h-screen bg-gray-50 pb-24 pt-12">
       <div className="mx-auto max-w-3xl space-y-10 px-4">
 
+        {/* Auto-cleanup banner */}
+        {autoCleaned > 0 && (
+          <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-6 py-5">
+            <div className="flex items-start gap-4">
+              <span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-emerald-100">
+                <svg className="h-5 w-5 text-emerald-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 12.75 6 6 9-13.5" />
+                </svg>
+              </span>
+              <div>
+                <p className="text-base font-semibold text-emerald-900">
+                  We already cleaned {autoCleaned.toLocaleString()} emails automatically
+                </p>
+                <p className="mt-1 text-sm text-emerald-700">
+                  {autoCleaned.toLocaleString()} obvious junk email{autoCleaned !== 1 ? "s" : ""} from {autoCleanedSenders} sender{autoCleanedSenders !== 1 ? "s" : ""} were
+                  archived — spam, promotions, and newsletters you never opened.
+                  Everything below still needs your review.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Header */}
         <header>
           <h1 className="text-3xl font-bold text-gray-900">Your inbox diagnosis</h1>
           <p className="mt-2 text-base text-gray-500">
             {s.total_messages > 0
-              ? `Here's what we found across ${s.total_messages.toLocaleString()} emails.`
+              ? autoCleaned > 0
+                ? `Here's what needs your review across the remaining emails.`
+                : `Here's what we found across ${s.total_messages.toLocaleString()} emails.`
               : "Here's what we found."}
           </p>
         </header>
