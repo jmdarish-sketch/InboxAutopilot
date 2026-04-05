@@ -8,7 +8,7 @@ import { useToast } from "@/components/shared/ToastProvider";
 // Mode definitions
 // ---------------------------------------------------------------------------
 
-type AutopilotMode = "suggest_only" | "safe" | "aggressive";
+type AutopilotMode = "suggest_only" | "safe" | "balanced" | "aggressive";
 
 interface ModeConfig {
   id:          AutopilotMode;
@@ -16,7 +16,7 @@ interface ModeConfig {
   description: string;
   bullets:     string[];
   risk:        string;
-  riskColor:   "gray" | "green" | "amber";
+  riskColor:   "gray" | "green" | "blue" | "amber";
   recommended?: boolean;
 }
 
@@ -36,14 +36,26 @@ const MODES: ModeConfig[] = [
   {
     id:          "safe",
     title:       "Safe Autopilot",
-    description: "Automatically archives high-confidence clutter. Borderline cases come to your review queue.",
+    description: "Only archives when extremely confident. Very conservative — most emails go to review.",
     bullets: [
-      "Auto-archives obvious promotions and newsletters",
-      "Uncertain emails land in your review queue",
-      "Important senders are always protected",
+      "Archives only obvious junk (score > 0.80)",
+      "Most borderline emails go to your review queue",
+      "No automatic unsubscribes",
+    ],
+    risk:        "Very low risk",
+    riskColor:   "green",
+  },
+  {
+    id:          "balanced",
+    title:       "Balanced Autopilot",
+    description: "Smart automation that handles clear junk and asks about anything ambiguous.",
+    bullets: [
+      "Archives senders you consistently ignore (score > 0.65)",
+      "Creates Gmail filters for worst offenders",
+      "Can auto-unsubscribe from high-confidence junk",
     ],
     risk:        "Low risk",
-    riskColor:   "green",
+    riskColor:   "blue",
     recommended: true,
   },
   {
@@ -51,9 +63,9 @@ const MODES: ModeConfig[] = [
     title:       "Aggressive Autopilot",
     description: "Handles most low-value email automatically while still protecting important categories.",
     bullets: [
-      "Archives broadly with a lower confidence threshold",
+      "Archives broadly — even moderate junk (score > 0.50)",
+      "Auto-unsubscribes from persistent junk senders",
       "Financial, security, and personal emails stay protected",
-      "Fewer items in review queue, more automation",
     ],
     risk:      "Medium risk",
     riskColor: "amber",
@@ -64,10 +76,11 @@ const MODES: ModeConfig[] = [
 // Risk pill
 // ---------------------------------------------------------------------------
 
-function RiskPill({ label, color }: { label: string; color: "gray" | "green" | "amber" }) {
+function RiskPill({ label, color }: { label: string; color: "gray" | "green" | "blue" | "amber" }) {
   const styles = {
     gray:  "bg-gray-100 text-gray-600",
     green: "bg-green-100 text-green-700",
+    blue:  "bg-blue-100 text-blue-700",
     amber: "bg-amber-100 text-amber-700",
   };
   return (
@@ -163,7 +176,7 @@ export default function AutopilotModeSelector() {
   const router = useRouter();
   const [, startTransition] = useTransition();
   const { toast } = useToast();
-  const [selected, setSelected] = useState<AutopilotMode>("safe");
+  const [selected, setSelected] = useState<AutopilotMode>("balanced");
   const [saving, setSaving]     = useState(false);
   const [error, setError]       = useState<string | null>(null);
 
@@ -206,7 +219,7 @@ export default function AutopilotModeSelector() {
         </header>
 
         {/* Mode cards */}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {MODES.map(mode => (
             <ModeCard
               key={mode.id}

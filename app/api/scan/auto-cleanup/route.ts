@@ -3,6 +3,7 @@ import { createAdminClient }  from "@/lib/supabase/admin";
 import { getSupabaseUserId }  from "@/lib/auth/get-user";
 import { archiveGmailMessages, createGmailFilter } from "@/lib/gmail/actions";
 import { setSenderRule }      from "@/lib/senders/set-rule";
+import { computeSenderJunkScore, MODE_THRESHOLDS } from "@/lib/scoring/junk-score";
 import type { ScanProgress }  from "@/app/api/scan/start/route";
 
 export const dynamic = "force-dynamic";
@@ -10,24 +11,20 @@ export const dynamic = "force-dynamic";
 // ---------------------------------------------------------------------------
 // POST /api/scan/auto-cleanup
 //
-// Runs after the initial scan completes. Automatically archives emails that
-// are extremely obviously junk — conservative thresholds only.
+// Runs after the initial scan. Uses weighted junk scoring with the 'safe'
+// threshold (0.80) for onboarding — conservative but not absurdly so.
 //
-// Criteria (ALL must be true):
-//   - final_category in (spam_like, promotion, newsletter)
-//   - confidence_score >= 0.90
-//   - has_unsubscribe_header = true
-//   - sender has zero opens, replies, and stars across ALL their emails
-//   - email is older than 7 days
+// Old approach: required ALL of (spam category, 0.90 confidence, unsub header,
+// zero engagement, 7 days old). That was too restrictive.
 //
-// This runs in one shot (not chunked) because it only touches DB + Gmail
-// batch API, not individual message fetches.
+// New approach: score each sender holistically. A sender with 50 emails and
+// 2 opens has a 96% ignore rate — that's junk even though open_count != 0.
 // ---------------------------------------------------------------------------
 
-const JUNK_CATEGORIES = ["spam_like", "promotion", "newsletter"];
-const CONFIDENCE_THRESHOLD = 0.90;
-const AGE_DAYS = 7;
-const BATCH_SIZE = 500; // Gmail batchModify limit per call
+const ONBOARDING_THRESHOLD = MODE_THRESHOLDS.safe.archiveThreshold; // 0.80
+const FILTER_THRESHOLD     = MODE_THRESHOLDS.safe.filterThreshold;  // 0.92
+const AGE_DAYS = 7; // Only archive emails older than 7 days during onboarding
+const MIN_MESSAGES = 3; // Need enough data to score
 
 export async function POST() {
   const supabaseUserId = await getSupabaseUserId();
@@ -37,7 +34,6 @@ export async function POST() {
 
   const supabase = createAdminClient();
 
-  // Check if auto-cleanup is expected
   const { data: gmailAccount } = await supabase
     .from("gmail_accounts")
     .select("id, sync_status")
@@ -50,7 +46,6 @@ export async function POST() {
     return NextResponse.json({ error: "Gmail not connected" }, { status: 400 });
   }
 
-  // If already completed (sync_status is "synced"), return done
   if (gmailAccount.sync_status === "synced") {
     return NextResponse.json({
       stage: "complete",
@@ -63,49 +58,96 @@ export async function POST() {
   const cutoffDate = new Date(Date.now() - AGE_DAYS * 86_400_000).toISOString();
 
   try {
-    // ── 1. Find senders with zero engagement ──────────────────────────────
-    const { data: zeroEngagementSenders } = await supabase
+    // ── 1. Fetch all senders with enough messages to score ────────────────
+    const { data: senders } = await supabase
       .from("senders")
-      .select("id, sender_email")
+      .select(
+        "id, sender_email, message_count, open_count, reply_count, archive_count, " +
+        "restore_count, ignore_count, sender_category, learned_state, last_engaged_at"
+      )
       .eq("user_id", supabaseUserId)
-      .eq("open_count", 0)
-      .eq("reply_count", 0)
-      .gt("message_count", 0) as unknown as {
-        data: Array<{ id: string; sender_email: string }> | null;
+      .gte("message_count", MIN_MESSAGES)
+      .neq("learned_state", "always_keep")
+      .neq("learned_state", "always_archive") as unknown as {
+        data: Array<{
+          id: string; sender_email: string; message_count: number;
+          open_count: number; reply_count: number; archive_count: number;
+          restore_count: number; ignore_count: number;
+          sender_category: string | null; learned_state: string;
+          last_engaged_at: string | null;
+        }> | null;
       };
 
-    if (!zeroEngagementSenders || zeroEngagementSenders.length === 0) {
+    if (!senders || senders.length === 0) {
       return complete(supabase, supabaseUserId, gmailAccount.id, 0, 0);
     }
 
-    const senderIds = zeroEngagementSenders.map(s => s.id);
-
-    // Also exclude senders whose messages have been starred
-    const { data: starredSenders } = await supabase
+    // ── 2. Check which senders have unsubscribe headers ───────────────────
+    const senderIds = senders.map(s => s.id);
+    const { data: unsubRows } = await supabase
       .from("messages")
       .select("sender_id")
       .eq("user_id", supabaseUserId)
-      .eq("is_starred", true)
-      .in("sender_id", senderIds);
+      .in("sender_id", senderIds)
+      .eq("has_unsubscribe_header", true)
+      .limit(1000);
 
-    const starredSet = new Set((starredSenders ?? []).map(m => m.sender_id));
-    const eligibleSenderIds = senderIds.filter(id => !starredSet.has(id));
+    const unsubSet = new Set((unsubRows ?? []).map(r => r.sender_id));
 
-    if (eligibleSenderIds.length === 0) {
+    // Check for starred senders (strong protection)
+    const { data: starredRows } = await supabase
+      .from("messages")
+      .select("sender_id")
+      .eq("user_id", supabaseUserId)
+      .in("sender_id", senderIds)
+      .eq("is_starred", true);
+
+    const starredSet = new Set((starredRows ?? []).map(r => r.sender_id));
+
+    // ── 3. Score each sender ──────────────────────────────────────────────
+    const junkSenders: Array<{ id: string; email: string; score: number; signals: string[] }> = [];
+
+    for (const s of senders) {
+      // Skip starred senders entirely
+      if (starredSet.has(s.id)) continue;
+
+      const result = computeSenderJunkScore({
+        message_count:     s.message_count,
+        open_count:        s.open_count,
+        reply_count:       s.reply_count,
+        archive_count:     s.archive_count,
+        restore_count:     s.restore_count,
+        ignore_count:      s.ignore_count,
+        dominant_category: s.sender_category,
+        has_unsubscribe:   unsubSet.has(s.id),
+        last_engaged_at:   s.last_engaged_at,
+        learned_state:     s.learned_state,
+      });
+
+      if (result.score >= ONBOARDING_THRESHOLD) {
+        junkSenders.push({
+          id:      s.id,
+          email:   s.sender_email,
+          score:   result.score,
+          signals: result.signals,
+        });
+      }
+    }
+
+    if (junkSenders.length === 0) {
       return complete(supabase, supabaseUserId, gmailAccount.id, 0, 0);
     }
 
-    // ── 2. Find junk messages from those senders ──────────────────────────
+    // ── 4. Find archivable messages from junk senders ─────────────────────
+    const junkSenderIds = junkSenders.map(s => s.id);
+
     const { data: junkMessages } = await supabase
       .from("messages")
       .select("id, gmail_message_id, sender_id")
       .eq("user_id", supabaseUserId)
-      .in("final_category", JUNK_CATEGORIES)
-      .gte("confidence_score", CONFIDENCE_THRESHOLD)
-      .eq("has_unsubscribe_header", true)
-      .lte("internal_date", cutoffDate)
-      .in("sender_id", eligibleSenderIds)
-      .eq("action_status", "none") as unknown as {
+      .in("sender_id", junkSenderIds)
+      .eq("action_status", "none")
+      .lte("internal_date", cutoffDate) as unknown as {
         data: Array<{ id: string; gmail_message_id: string; sender_id: string }> | null;
       };
 
@@ -113,18 +155,16 @@ export async function POST() {
       return complete(supabase, supabaseUserId, gmailAccount.id, 0, 0);
     }
 
-    // ── 3. Archive via Gmail API ──────────────────────────────────────────
+    // ── 5. Archive via Gmail API ──────────────────────────────────────────
     const gmailIds = junkMessages.map(m => m.gmail_message_id).filter(Boolean);
-
     if (gmailIds.length > 0) {
-      // archiveGmailMessages already handles batching and the Autopilot/Archived label
       await archiveGmailMessages(supabaseUserId, gmailIds);
     }
 
-    // ── 4. Update message status ──────────────────────────────────────────
+    // ── 6. Update message status ──────────────────────────────────────────
     const messageIds = junkMessages.map(m => m.id);
-    for (let i = 0; i < messageIds.length; i += BATCH_SIZE) {
-      const chunk = messageIds.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < messageIds.length; i += 500) {
+      const chunk = messageIds.slice(i, i + 500);
       await supabase
         .from("messages")
         .update({
@@ -137,8 +177,7 @@ export async function POST() {
         .in("id", chunk);
     }
 
-    // ── 5. Log actions ────────────────────────────────────────────────────
-    // Group by sender for efficient logging
+    // ── 7. Log actions + create rules/filters for high-score senders ──────
     const bySender = new Map<string, string[]>();
     for (const m of junkMessages) {
       const list = bySender.get(m.sender_id) ?? [];
@@ -146,55 +185,43 @@ export async function POST() {
       bySender.set(m.sender_id, list);
     }
 
+    const junkScoreMap = new Map(junkSenders.map(s => [s.id, s]));
+
     for (const [senderId, gmailMsgIds] of bySender) {
+      const scored = junkScoreMap.get(senderId);
+
       await supabase.from("actions_log").insert({
         user_id:       supabaseUserId,
         sender_id:     senderId,
         action_type:   "archive",
         action_source: "initial_cleanup_auto",
         status:        "succeeded",
-        reason:        "auto_junk_cleanup",
+        reason:        `junk_score=${scored?.score.toFixed(2) ?? "?"}: ${scored?.signals.join(", ") ?? ""}`,
         reversible:    true,
-        metadata:      { archived_count: gmailMsgIds.length },
+        metadata:      { archived_count: gmailMsgIds.length, junk_score: scored?.score },
       });
-    }
 
-    // ── 6. Auto-rules for heavy senders ───────────────────────────────────
-    // Senders with 5+ junk messages: create always_archive rule + Gmail filter
-    const autoRuleSenders: string[] = [];
-    for (const [senderId, gmailMsgIds] of bySender) {
-      if (gmailMsgIds.length >= 5) {
-        autoRuleSenders.push(senderId);
+      // Create rules + filters for high-confidence junk senders
+      if (scored && scored.score >= FILTER_THRESHOLD) {
         await setSenderRule(supabaseUserId, senderId, "always_archive", "initial_cleanup_auto");
 
-        const senderEmail = zeroEngagementSenders.find(s => s.id === senderId)?.sender_email;
-        if (senderEmail) {
-          const filterResult = await createGmailFilter(supabaseUserId, senderEmail);
-          await supabase.from("actions_log").insert({
-            user_id:       supabaseUserId,
-            sender_id:     senderId,
-            action_type:   "gmail_filter_created",
-            action_source: "initial_cleanup_auto",
-            status:        filterResult.created ? "succeeded" : "failed",
-            reason:        `auto_junk_sender_${gmailMsgIds.length}_emails`,
-            metadata:      { filter_id: filterResult.filterId },
-          });
-        }
+        const filterResult = await createGmailFilter(supabaseUserId, scored.email);
+        await supabase.from("actions_log").insert({
+          user_id:       supabaseUserId,
+          sender_id:     senderId,
+          action_type:   "gmail_filter_created",
+          action_source: "initial_cleanup_auto",
+          status:        filterResult.created ? "succeeded" : "failed",
+          reason:        `junk_score=${scored.score.toFixed(2)}_above_filter_threshold`,
+          metadata:      { filter_id: filterResult.filterId, junk_score: scored.score },
+        });
       }
     }
 
-    // ── 7. Mark complete ──────────────────────────────────────────────────
-    return complete(
-      supabase,
-      supabaseUserId,
-      gmailAccount.id,
-      junkMessages.length,
-      bySender.size
-    );
+    return complete(supabase, supabaseUserId, gmailAccount.id, junkMessages.length, bySender.size);
 
   } catch (err) {
     console.error("[auto-cleanup] error:", err);
-    // On error, still finalize so the user isn't stuck
     await supabase
       .from("gmail_accounts")
       .update({ sync_status: "synced", updated_at: new Date().toISOString() })

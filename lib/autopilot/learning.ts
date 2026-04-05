@@ -347,6 +347,20 @@ export async function recordFeedbackAndRetrain(
 
   const senderId = options.senderId;
 
+  // ── 2b. Update last_engaged_at for engagement events ────────────────────
+  const ENGAGEMENT_EVENTS = new Set([
+    "email_opened", "email_replied", "email_clicked",
+    "email_marked_important", "email_restored", "search_for_sender",
+    "review_keep", "sender_keep_forever",
+  ]);
+
+  if (ENGAGEMENT_EVENTS.has(eventType)) {
+    await supabase
+      .from("senders")
+      .update({ last_engaged_at: new Date().toISOString() })
+      .eq("id", senderId);
+  }
+
   // ── 3. Hard overrides — bypass decay computation ─────────────────────────
   if (eventType === "sender_keep_forever") {
     await supabase

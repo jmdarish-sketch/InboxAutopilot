@@ -8,6 +8,7 @@ import { shouldUseLLM, classifyWithLLM }  from "@/lib/classification/llm";
 import { resolveFinalClassification }     from "@/lib/classification/final-decision";
 import { decideAutopilotExecution }       from "@/lib/autopilot/policy";
 import { computeBehaviorScore }           from "@/lib/autopilot/learning";
+import { computeSenderJunkScore, MODE_THRESHOLDS } from "@/lib/scoring/junk-score";
 import { createGmailFilter }             from "@/lib/gmail/actions";
 import { setSenderRule }                  from "@/lib/senders/set-rule";
 import type { AutopilotMode }             from "@/lib/autopilot/policy";
@@ -18,16 +19,20 @@ import type { NormalizedMessage }         from "@/lib/gmail/types";
 // ---------------------------------------------------------------------------
 
 interface FullSenderRow {
-  id:            string;
-  message_count: number;
-  open_count:    number;
-  reply_count:   number;
-  archive_count: number;
-  restore_count: number;
-  click_count:   number;
-  search_count:  number;
-  last_seen_at:  string | null;
-  learned_state: string;
+  id:              string;
+  sender_email:    string;
+  message_count:   number;
+  open_count:      number;
+  reply_count:     number;
+  archive_count:   number;
+  restore_count:   number;
+  click_count:     number;
+  search_count:    number;
+  ignore_count:    number;
+  last_seen_at:    string | null;
+  last_engaged_at: string | null;
+  learned_state:   string;
+  sender_category: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +130,33 @@ export async function runAutopilot(supabaseUserId: string): Promise<{
       });
 
       // ── g. Execution decision ────────────────────────────────────────────
-      const execution = decideAutopilotExecution(final, sender.restore_count, mode);
+      let execution = decideAutopilotExecution(final, sender.restore_count, mode);
+
+      // Junk-score override: if the classifier is uncertain but the sender's
+      // weighted junk score exceeds the mode threshold, archive anyway.
+      if (execution.type === "queue_review" && sender.message_count >= 3) {
+        const hasUnsub = msg.has_unsubscribe_header ?? false;
+        const junkResult = computeSenderJunkScore({
+          message_count:     sender.message_count,
+          open_count:        sender.open_count,
+          reply_count:       sender.reply_count,
+          archive_count:     sender.archive_count,
+          restore_count:     sender.restore_count,
+          ignore_count:      sender.ignore_count,
+          dominant_category: sender.sender_category,
+          has_unsubscribe:   hasUnsub,
+          last_engaged_at:   sender.last_engaged_at,
+          learned_state:     sender.learned_state,
+        });
+
+        const thresholds = MODE_THRESHOLDS[mode] ?? MODE_THRESHOLDS.balanced;
+        if (junkResult.score >= thresholds.archiveThreshold) {
+          execution = {
+            type:   "auto_archive",
+            reason: `junk_score=${junkResult.score.toFixed(2)}_above_${mode}_threshold`,
+          };
+        }
+      }
 
       // ── h. Persist message row ───────────────────────────────────────────
       const { data: savedMsg } = await supabase
@@ -369,8 +400,8 @@ async function upsertSender(
   const { data: existing } = await supabase
     .from("senders")
     .select(
-      "id, message_count, open_count, reply_count, archive_count, restore_count, " +
-      "click_count, search_count, last_seen_at, learned_state"
+      "id, sender_email, message_count, open_count, reply_count, archive_count, restore_count, " +
+      "click_count, search_count, ignore_count, last_seen_at, last_engaged_at, learned_state, sender_category"
     )
     .eq("user_id", supabaseUserId)
     .eq("sender_email", msg.sender_email)
@@ -412,15 +443,19 @@ async function upsertSender(
 
 function blankSender(): FullSenderRow {
   return {
-    id:            "",
-    message_count: 0,
-    open_count:    0,
-    reply_count:   0,
-    archive_count: 0,
-    restore_count: 0,
-    click_count:   0,
-    search_count:  0,
-    last_seen_at:  null,
-    learned_state: "unknown",
+    id:              "",
+    sender_email:    "",
+    message_count:   0,
+    open_count:      0,
+    reply_count:     0,
+    archive_count:   0,
+    restore_count:   0,
+    click_count:     0,
+    search_count:    0,
+    ignore_count:    0,
+    last_seen_at:    null,
+    last_engaged_at: null,
+    learned_state:   "unknown",
+    sender_category: null,
   };
 }

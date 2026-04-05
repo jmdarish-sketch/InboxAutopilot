@@ -98,9 +98,15 @@ function Hero() {
             <GoogleIcon />
             Connect Gmail
           </Link>
+          <Link
+            href="/sign-in"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-gray-200 bg-white px-7 py-3.5 text-sm font-semibold text-gray-700 transition-colors hover:border-gray-300 hover:bg-gray-50"
+          >
+            Sign in
+          </Link>
           <a
             href="#how-it-works"
-            className="inline-flex items-center gap-1.5 rounded-xl border border-gray-200 bg-white px-7 py-3.5 text-sm font-semibold text-gray-700 transition-colors hover:border-gray-300 hover:bg-gray-50"
+            className="inline-flex items-center gap-1.5 text-sm font-medium text-gray-500 transition-colors hover:text-gray-700"
           >
             See how it works
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">

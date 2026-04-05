@@ -22,7 +22,7 @@ export interface UserPreferences {
 }
 
 export interface UserSettings {
-  autopilotMode:       "suggest_only" | "safe" | "aggressive";
+  autopilotMode:       "suggest_only" | "safe" | "balanced" | "aggressive";
   connectedGmailEmail: string | null;
   preferences:         UserPreferences;
 }
@@ -170,7 +170,7 @@ export async function PATCH(req: NextRequest) {
   }
 
   // Validate autopilotMode if provided
-  const validModes = ["suggest_only", "safe", "aggressive"];
+  const validModes = ["suggest_only", "safe", "balanced", "aggressive"];
   if (
     body.autopilotMode !== undefined &&
     !validModes.includes(body.autopilotMode)

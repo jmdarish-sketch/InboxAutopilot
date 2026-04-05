@@ -280,7 +280,7 @@ export default function SettingsForm({ initial }: SettingsFormProps) {
           {/* Mode selector */}
           <div className="space-y-2">
             <p className="text-xs font-medium uppercase tracking-wide text-gray-400">Mode</p>
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
               {(
                 [
                   {
@@ -291,14 +291,20 @@ export default function SettingsForm({ initial }: SettingsFormProps) {
                   },
                   {
                     value:       "safe" as const,
-                    label:       "Safe autopilot",
-                    description: "Archives high-confidence clutter. Borderline items go to review.",
+                    label:       "Safe",
+                    description: "Archives only obvious junk. Very conservative.",
+                    recommended: false,
+                  },
+                  {
+                    value:       "balanced" as const,
+                    label:       "Balanced",
+                    description: "Smart automation. Handles clear junk, asks about ambiguous.",
                     recommended: true,
                   },
                   {
                     value:       "aggressive" as const,
-                    label:       "Aggressive autopilot",
-                    description: "Handles more automatically. Still protects important categories.",
+                    label:       "Aggressive",
+                    description: "Handles most low-value email automatically.",
                     recommended: false,
                   },
                 ] as const

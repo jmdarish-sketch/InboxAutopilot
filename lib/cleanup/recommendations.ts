@@ -1,4 +1,5 @@
 import { createAdminClient } from "@/lib/supabase/admin";
+import { computeSenderJunkScore } from "@/lib/scoring/junk-score";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -85,21 +86,30 @@ export async function buildCleanupRecommendations(
   const supabase = createAdminClient();
 
   const [clutterResult, protectedResult] = await Promise.all([
+    // Fetch all senders with enough messages for scoring — the weighted junk
+    // score replaces the old static clutter_score/importance_score filters
     supabase
       .from("senders")
       .select(
-        "id, sender_email, sender_name, sender_domain, message_count, open_count, clutter_score, importance_score, restore_count, learned_state"
+        "id, sender_email, sender_name, sender_domain, message_count, open_count, " +
+        "reply_count, archive_count, restore_count, ignore_count, clutter_score, " +
+        "importance_score, learned_state, sender_category, last_engaged_at"
       )
       .eq("user_id", supabaseUserId)
-      .gte("clutter_score", 70)
-      .lte("importance_score", 35)
       .gte("message_count", 3)
-      .eq("restore_count", 0)
-      // Exclude senders already handled by auto-cleanup
       .neq("learned_state", "always_archive")
       .neq("learned_state", "always_keep")
       .order("message_count", { ascending: false })
-      .limit(25),
+      .limit(100) as unknown as {
+        data: Array<{
+          id: string; sender_email: string; sender_name: string | null;
+          sender_domain: string; message_count: number; open_count: number;
+          reply_count: number; archive_count: number; restore_count: number;
+          ignore_count: number; clutter_score: number; importance_score: number;
+          learned_state: string; sender_category: string | null;
+          last_engaged_at: string | null;
+        }> | null;
+      },
 
     supabase
       .from("senders")
@@ -131,7 +141,7 @@ export async function buildCleanupRecommendations(
 
   const senderIds = clutter.map(s => s.id);
 
-  // First check which senders still have unarchived messages
+  // Check which senders still have unarchived messages
   const { data: unarchivedCounts } = await supabase
     .from("messages")
     .select("sender_id")
@@ -143,15 +153,47 @@ export async function buildCleanupRecommendations(
     (unarchivedCounts ?? []).map(m => m.sender_id)
   );
 
-  // Filter to only senders that still have work to do
-  const activeSenderIds = senderIds.filter(id => sendersWithUnarchived.has(id));
+  // Check which senders have unsubscribe headers
+  const { data: unsubRows } = await supabase
+    .from("messages")
+    .select("sender_id")
+    .eq("user_id", supabaseUserId)
+    .in("sender_id", senderIds)
+    .eq("has_unsubscribe_header", true)
+    .limit(1000);
+
+  const hasUnsub = new Set((unsubRows ?? []).map(m => m.sender_id));
+
+  // Score each sender and filter by junk score threshold (0.50 = show as recommendation)
+  const scoredSenders = clutter
+    .filter(s => sendersWithUnarchived.has(s.id))
+    .map(s => {
+      const junk = computeSenderJunkScore({
+        message_count:     s.message_count,
+        open_count:        s.open_count,
+        reply_count:       s.reply_count ?? 0,
+        archive_count:     s.archive_count ?? 0,
+        restore_count:     s.restore_count,
+        ignore_count:      s.ignore_count ?? 0,
+        dominant_category: s.sender_category ?? null,
+        has_unsubscribe:   hasUnsub.has(s.id),
+        last_engaged_at:   s.last_engaged_at ?? null,
+        learned_state:     s.learned_state ?? "unknown",
+      });
+      return { sender: s, junk };
+    })
+    .filter(({ junk }) => junk.score >= 0.50)
+    .sort((a, b) => b.junk.score - a.junk.score)
+    .slice(0, 25);
+
+  const activeSenderIds = scoredSenders.map(({ sender }) => sender.id);
 
   if (activeSenderIds.length === 0) {
     return { recommendations: [], protected: protectedSenders };
   }
 
-  // Parallel enrichment — only count unarchived messages
-  const [recentResult, unsubResult, subjectsResult] = await Promise.all([
+  // Enrichment queries
+  const [recentResult, subjectsResult] = await Promise.all([
     supabase
       .from("messages")
       .select("sender_id")
@@ -159,15 +201,6 @@ export async function buildCleanupRecommendations(
       .in("sender_id", activeSenderIds)
       .eq("action_status", "none")
       .gte("internal_date", new Date(Date.now() - 30 * 86400_000).toISOString()),
-
-    supabase
-      .from("messages")
-      .select("sender_id")
-      .eq("user_id", supabaseUserId)
-      .in("sender_id", activeSenderIds)
-      .eq("action_status", "none")
-      .not("unsubscribe_url", "is", null)
-      .limit(500),
 
     supabase
       .from("messages")
@@ -185,9 +218,6 @@ export async function buildCleanupRecommendations(
     recentCounts.set(m.sender_id, (recentCounts.get(m.sender_id) ?? 0) + 1);
   }
 
-  const hasUnsub = new Set((unsubResult.data ?? []).map(m => m.sender_id));
-
-  // Up to 3 unique subjects per sender (already ordered by date desc)
   const subjectsMap = new Map<string, string[]>();
   for (const m of subjectsResult.data ?? []) {
     const existing = subjectsMap.get(m.sender_id) ?? [];
@@ -197,20 +227,17 @@ export async function buildCleanupRecommendations(
     }
   }
 
-  const recommendations: CleanupRecommendation[] = clutter
-    .filter(s => {
-      // Only include senders that still have unarchived messages
-      if (!sendersWithUnarchived.has(s.id)) return false;
-      // Safety: skip senders with meaningful open rate (>15%)
-      const openRate = s.message_count > 0 ? s.open_count / s.message_count : 0;
-      return openRate <= 0.15;
-    })
-    .map(s => {
+  const recommendations: CleanupRecommendation[] = scoredSenders
+    .map(({ sender: s, junk }) => {
       const recentCount = recentCounts.get(s.id) ?? 0;
       const hasSub      = hasUnsub.has(s.id);
       const openRate    = s.message_count > 0
         ? Math.round((s.open_count / s.message_count) * 100)
         : 0;
+
+      // Confidence based on junk score, not just clutter_score
+      const confidence: "High" | "Medium" | "Low" =
+        junk.score >= 0.85 ? "High" : junk.score >= 0.65 ? "Medium" : "Low";
 
       return {
         senderId:        s.id,
@@ -221,7 +248,7 @@ export async function buildCleanupRecommendations(
         recentCount,
         openRate,
         suggestedAction: hasSub ? "unsubscribe_and_archive" : "archive",
-        confidence:      confidenceLabel(s.clutter_score),
+        confidence,
         reason:          buildReason(s.message_count, recentCount, s.open_count, hasSub),
         sampleSubjects:  subjectsMap.get(s.id) ?? [],
       };
