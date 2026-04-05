@@ -102,6 +102,31 @@ export async function POST() {
   };
 
   try {
+    // ── Guard: don't re-scan if already completed ──────────────────────
+    if (gmailAccount.sync_status === "synced" && !gmailAccount.scan_state) {
+      // Scan already finished — return complete immediately
+      const [senderRes, clutterRes, protectedRes] = await Promise.all([
+        supabase.from("senders").select("id", { count: "exact", head: true }).eq("user_id", supabaseUserId),
+        supabase.from("messages").select("id", { count: "exact", head: true }).eq("user_id", supabaseUserId)
+          .in("final_category", [...CLUTTER_CATEGORIES]),
+        supabase.from("senders").select("id", { count: "exact", head: true }).eq("user_id", supabaseUserId)
+          .gte("importance_score", 65),
+      ]);
+      const totalRes = await supabase.from("messages").select("id", { count: "exact", head: true }).eq("user_id", supabaseUserId);
+
+      return NextResponse.json({
+        stage:            "complete",
+        emailsScanned:    totalRes.count ?? 0,
+        emailsTotal:      totalRes.count ?? 0,
+        sendersFound:     senderRes.count ?? 0,
+        clutterDetected:  clutterRes.count ?? 0,
+        protectedSenders: protectedRes.count ?? 0,
+        autoArchived:     0,
+        autoArchivedSenders: 0,
+        message:          "Scan already completed.",
+      } satisfies ScanProgress);
+    }
+
     // ── Phase 1: List message IDs (first call only) ──────────────────────
     if (!gmailAccount.scan_state) {
       let gmailClient;
